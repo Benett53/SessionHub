@@ -1,0 +1,52 @@
+[package]
+name = "sessionhub"
+version = "0.1.0"
+description = "SessionHub - cross-platform SSH / Telnet / Serial / Shell session manager"
+authors = ["SessionHub contributors"]
+edition = "2021"
+rust-version = "1.89"
+
+[lib]
+name = "sessionhub_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+# `ring` instead of the default aws-lc-rs: pure cc build, no cmake/nasm needed on any platform.
+russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
+portable-pty = "0.9"
+# No libudev dependency -> works on every distro (and in Flatpak/AppImage) without extra libs.
+serialport = { version = "4", default-features = false }
+# Linux: Secret Service via a vendored libdbus, so no distro-specific dbus headers are required.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+directories = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+parking_lot = "0.12"
+quick-xml = "0.38"
+log = "0.4"
+env_logger = "0.11"
+dirs = "6"
+hmac = "0.12"
+sha1 = "0.10"
+data-encoding = "2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
