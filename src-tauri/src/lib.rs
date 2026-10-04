@@ -58,6 +58,23 @@ impl AppState {
         Ok(out)
     }
 
+    /// Remember when a saved session was last used (for "recent" lists).
+    fn touch(&self, id: &str) {
+        if id.is_empty() || self.store.lock().session(id).is_none() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = self.update_store(|st| {
+            if let Some(s) = st.sessions.iter_mut().find(|s| s.id == id) {
+                s.last_used = now;
+            }
+            Ok(())
+        });
+    }
+
     fn log_dir(&self) -> PathBuf {
         let s = self.settings.lock();
         if s.log_dir.trim().is_empty() {
@@ -134,9 +151,16 @@ fn delete_sessions(state: State<'_, AppState>, ids: Vec<String>) -> CmdResult<()
 }
 
 #[tauri::command]
-fn save_folder(state: State<'_, AppState>, mut folder: Folder) -> CmdResult<Folder> {
+fn save_folder(state: State<'_, AppState>, mut folder: Folder, password: Option<String>) -> CmdResult<Folder> {
     if folder.id.is_empty() {
         folder.id = uuid::Uuid::new_v4().to_string();
+    }
+    if folder.save_password {
+        if let Some(pw) = password.as_deref().filter(|p| !p.is_empty()) {
+            secrets::set(secrets::Kind::Password, &folder.id, pw).map_err(err)?;
+        }
+    } else {
+        secrets::delete(secrets::Kind::Password, &folder.id);
     }
     let saved = folder.clone();
     state.update_store(move |st| {
@@ -168,7 +192,7 @@ fn delete_folder(state: State<'_, AppState>, id: String) -> CmdResult<()> {
             .collect();
         st.sessions.retain(|s| !removed.contains(&s.id));
         st.folders.retain(|f| !tree.contains(&f.id));
-        Ok(removed)
+        Ok(removed.into_iter().chain(tree).collect::<Vec<_>>())
     })?;
     for id in removed {
         secrets::delete_all(&id);
@@ -240,6 +264,8 @@ async fn connect(
     let settings = state.settings.lock().clone();
     let store = state.store.lock().clone();
     let log_dir = state.log_dir();
+    let session = store.resolve(&session);
+    state.touch(&session.id);
     let params = ConnectParams {
         session,
         password: password.filter(|p| !p.is_empty()),
@@ -252,6 +278,146 @@ async fn connect(
         on_event,
     };
     state.conns.open(params).map_err(err)
+}
+
+#[tauri::command]
+async fn sftp_open(
+    state: State<'_, AppState>,
+    session: Session,
+    password: Option<String>,
+    on_data: Channel<InvokeResponseBody>,
+    on_event: Channel<ConnEvent>,
+) -> CmdResult<String> {
+    let settings = state.settings.lock().clone();
+    let store = state.store.lock().clone();
+    let session = store.resolve(&session);
+    let params = ConnectParams {
+        session,
+        password: password.filter(|p| !p.is_empty()),
+        settings,
+        store,
+        log_dir: PathBuf::new(),
+        cols: 80,
+        rows: 24,
+        on_data,
+        on_event,
+    };
+    state.conns.open_sftp(params).map_err(err)
+}
+
+#[tauri::command]
+async fn sftp_list(state: State<'_, AppState>, id: String, path: String) -> CmdResult<conn::sftp::Listing> {
+    state.conns.sftp(&id).map_err(err)?.list(&path).await.map_err(err)
+}
+
+#[tauri::command]
+async fn sftp_mkdir(state: State<'_, AppState>, id: String, path: String) -> CmdResult<()> {
+    state.conns.sftp(&id).map_err(err)?.mkdir(&path).await.map_err(err)
+}
+
+#[tauri::command]
+async fn sftp_rename(state: State<'_, AppState>, id: String, from: String, to: String) -> CmdResult<()> {
+    state
+        .conns
+        .sftp(&id)
+        .map_err(err)?
+        .rename(&from, &to)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+async fn sftp_remove(state: State<'_, AppState>, id: String, path: String) -> CmdResult<()> {
+    state.conns.sftp(&id).map_err(err)?.remove(&path).await.map_err(err)
+}
+
+#[tauri::command]
+async fn sftp_download(
+    state: State<'_, AppState>,
+    id: String,
+    remote: String,
+    local: String,
+    transfer: String,
+    on_progress: Channel<conn::sftp::Progress>,
+) -> CmdResult<()> {
+    let conn = state.conns.sftp(&id).map_err(err)?;
+    conn.download(&remote, std::path::Path::new(&local), &transfer, &on_progress)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+async fn sftp_upload(
+    state: State<'_, AppState>,
+    id: String,
+    local: String,
+    remote: String,
+    transfer: String,
+    on_progress: Channel<conn::sftp::Progress>,
+) -> CmdResult<()> {
+    let conn = state.conns.sftp(&id).map_err(err)?;
+    conn.upload(std::path::Path::new(&local), &remote, &transfer, &on_progress)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+fn sftp_cancel(state: State<'_, AppState>, id: String, transfer: String) {
+    if let Ok(c) = state.conns.sftp(&id) {
+        c.cancel(&transfer);
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Reachability {
+    id: String,
+    reachable: bool,
+    millis: u64,
+}
+
+/// TCP connect check for many sessions in parallel (mRemoteNG "port scan" light).
+#[tauri::command]
+async fn check_reachable(state: State<'_, AppState>, ids: Vec<String>) -> CmdResult<Vec<Reachability>> {
+    let store = state.store.lock().clone();
+    let mut tasks = Vec::new();
+    for id in ids.into_iter().take(500) {
+        let Some(s) = store.session(&id) else { continue };
+        let host = s.host.trim().to_string();
+        let port = s.effective_port();
+        if host.is_empty() || port == 0 {
+            continue;
+        }
+        tasks.push(tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let ok = matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::net::TcpStream::connect((host.as_str(), port))
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            Reachability {
+                id,
+                reachable: ok,
+                millis: start.elapsed().as_millis() as u64,
+            }
+        }));
+    }
+    let mut out = Vec::new();
+    for t in tasks {
+        if let Ok(r) = t.await {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn run_external_tool(state: State<'_, AppState>, session: Session, command: String) -> CmdResult<()> {
+    let session = state.store.lock().resolve(&session);
+    external::run_tool(&command, &session).map_err(err)
 }
 
 #[tauri::command]
@@ -291,10 +457,13 @@ fn prompt_reply(state: State<'_, AppState>, id: String, reply: PromptReply) -> C
 
 #[tauri::command]
 fn launch_external(state: State<'_, AppState>, session: Session, password: Option<String>) -> CmdResult<()> {
+    let session = state.store.lock().resolve(&session);
+    state.touch(&session.id);
     let password = password.filter(|p| !p.is_empty()).or_else(|| {
+        let owner = session.password_from.as_deref().unwrap_or(&session.id);
         session
             .save_password
-            .then(|| secrets::get(secrets::Kind::Password, &session.id))
+            .then(|| secrets::get(secrets::Kind::Password, owner))
             .flatten()
     });
     let settings = state.settings.lock().clone();
@@ -388,6 +557,16 @@ pub fn run() {
             disconnect,
             prompt_reply,
             launch_external,
+            sftp_open,
+            sftp_list,
+            sftp_mkdir,
+            sftp_rename,
+            sftp_remove,
+            sftp_download,
+            sftp_upload,
+            sftp_cancel,
+            check_reachable,
+            run_external_tool,
             list_serial_ports,
             list_shells,
             import_sessions,

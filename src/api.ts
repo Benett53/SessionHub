@@ -40,6 +40,9 @@ export interface Session {
   logOutput: boolean;
   color: string;
   notes: string;
+  favorite: boolean;
+  colorScheme: string;
+  lastUsed: number;
 }
 
 export interface Folder {
@@ -47,6 +50,26 @@ export interface Folder {
   name: string;
   parent: string | null;
   expanded: boolean;
+  username: string;
+  keyFile: string;
+  jumpHost: string | null;
+  savePassword: boolean;
+  color: string;
+  notes: string;
+}
+
+export interface Snippet {
+  id: string;
+  name: string;
+  command: string;
+  run: boolean;
+}
+
+export interface ExternalTool {
+  id: string;
+  name: string;
+  command: string;
+  inTerminal: boolean;
 }
 
 export interface SessionStore {
@@ -78,6 +101,10 @@ export interface Settings {
   rdpCommand: string;
   vncCommand: string;
   sidebarWidth: number;
+  terminalScheme: string;
+  snippets: Snippet[];
+  externalTools: ExternalTool[];
+  pasteWarnLines: number;
 }
 
 export interface Paths {
@@ -120,6 +147,31 @@ export interface ImportReport {
   warnings: string[];
 }
 
+export interface SftpEntry {
+  name: string;
+  isDir: boolean;
+  isLink: boolean;
+  size: number;
+  mtime: number;
+  mode: string;
+}
+
+export interface SftpListing {
+  path: string;
+  entries: SftpEntry[];
+}
+
+export interface Progress {
+  done: number;
+  total: number;
+}
+
+export interface Reachability {
+  id: string;
+  reachable: boolean;
+  millis: number;
+}
+
 export interface PortInfo {
   name: string;
   description: string;
@@ -136,7 +188,7 @@ export const api = {
   saveSession: (session: Session, password: string | null) =>
     invoke<Session>("save_session", { session, password }),
   deleteSessions: (ids: string[]) => invoke<void>("delete_sessions", { ids }),
-  saveFolder: (folder: Folder) => invoke<Folder>("save_folder", { folder }),
+  saveFolder: (folder: Folder, password: string | null = null) => invoke<Folder>("save_folder", { folder, password }),
   deleteFolder: (id: string) => invoke<void>("delete_folder", { id }),
   moveItems: (sessions: string[], folders: string[], target: string | null) =>
     invoke<void>("move_items", { sessions, folders, target }),
@@ -158,6 +210,19 @@ export const api = {
   promptReply: (id: string, reply: PromptReply) => invoke<void>("prompt_reply", { id, reply }),
   launchExternal: (session: Session, password: string | null) =>
     invoke<void>("launch_external", { session, password }),
+  sftpOpen: (session: Session, password: string | null, onData: Channel<ArrayBuffer>, onEvent: Channel<ConnEvent>) =>
+    invoke<string>("sftp_open", { session, password, onData, onEvent }),
+  sftpList: (id: string, path: string) => invoke<SftpListing>("sftp_list", { id, path }),
+  sftpMkdir: (id: string, path: string) => invoke<void>("sftp_mkdir", { id, path }),
+  sftpRename: (id: string, from: string, to: string) => invoke<void>("sftp_rename", { id, from, to }),
+  sftpRemove: (id: string, path: string) => invoke<void>("sftp_remove", { id, path }),
+  sftpDownload: (id: string, remote: string, local: string, transfer: string, onProgress: Channel<Progress>) =>
+    invoke<void>("sftp_download", { id, remote, local, transfer, onProgress }),
+  sftpUpload: (id: string, local: string, remote: string, transfer: string, onProgress: Channel<Progress>) =>
+    invoke<void>("sftp_upload", { id, local, remote, transfer, onProgress }),
+  sftpCancel: (id: string, transfer: string) => invoke<void>("sftp_cancel", { id, transfer }),
+  checkReachable: (ids: string[]) => invoke<Reachability[]>("check_reachable", { ids }),
+  runExternalTool: (session: Session, command: string) => invoke<void>("run_external_tool", { session, command }),
   listSerialPorts: () => invoke<PortInfo[]>("list_serial_ports"),
   listShells: () => invoke<ShellInfo[]>("list_shells"),
   importSessions: (kind: "mremoteng" | "putty" | "sshconfig" | "json", path: string | null) =>
@@ -196,8 +261,31 @@ export function newSession(partial: Partial<Session> = {}): Session {
     logOutput: false,
     color: "",
     notes: "",
+    favorite: false,
+    colorScheme: "",
+    lastUsed: 0,
     ...partial,
   };
+}
+
+export function newFolder(partial: Partial<Folder> = {}): Folder {
+  return {
+    id: "",
+    name: "",
+    parent: null,
+    expanded: true,
+    username: "",
+    keyFile: "",
+    jumpHost: null,
+    savePassword: false,
+    color: "",
+    notes: "",
+    ...partial,
+  };
+}
+
+export function uid(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export const DEFAULT_PORTS: Record<Protocol, number> = {

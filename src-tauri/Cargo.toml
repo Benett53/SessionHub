@@ -41,6 +41,7 @@ dirs = "6"
 hmac = "0.12"
 sha1 = "0.10"
 data-encoding = "2"
+russh-sftp = "3"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

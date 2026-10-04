@@ -74,6 +74,7 @@ fn root_folder(name: &str) -> Folder {
         name: name.into(),
         parent: None,
         expanded: true,
+        ..Default::default()
     }
 }
 
@@ -135,11 +136,15 @@ pub fn import_mremoteng(store: &mut SessionStore, path: &Path) -> Result<ImportR
         let parent = stack.iter().rev().find_map(|x| x.clone()).unwrap_or(root.id.clone());
         let get = |k: &str| a.get(k).cloned().unwrap_or_default();
         let opened = if get("Type").eq_ignore_ascii_case("Container") {
+            // Container credentials become inheritable folder defaults.
             let f = Folder {
                 id: new_id(),
                 name: get("Name"),
                 parent: Some(parent),
                 expanded: false,
+                username: get("Username"),
+                notes: get("Descr"),
+                ..Default::default()
             };
             let id = f.id.clone();
             folders.push(f);
@@ -170,6 +175,10 @@ pub fn import_mremoteng(store: &mut SessionStore, path: &Path) -> Result<ImportR
                     let domain = get("Domain");
                     if protocol == Protocol::Rdp && !domain.is_empty() && !s.username.is_empty() {
                         s.username = format!("{domain}\\{}", s.username);
+                    }
+                    // mRemoteNG "inherit from parent" -> leave empty, SessionHub inherits too.
+                    if get("InheritUsername").eq_ignore_ascii_case("true") {
+                        s.username.clear();
                     }
                     sessions.push(s);
                 }
@@ -481,8 +490,9 @@ mod tests {
     fn mremoteng_structure() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <mrng:Connections xmlns:mrng="http://mremoteng.org" Name="Connections" Export="false" EncryptionEngine="AES" FullFileEncryption="false" ConfVersion="2.6">
-  <Node Name="Servers" Type="Container" Expanded="true" Descr="">
+  <Node Name="Servers" Type="Container" Expanded="true" Descr="" Username="svc">
     <Node Name="web1" Type="Connection" Descr="frontend" Hostname="10.0.0.1" Username="root" Password="xyz" Protocol="SSH2" Port="22" />
+    <Node Name="web2" Type="Connection" Hostname="10.0.0.2" Username="x" InheritUsername="True" Protocol="SSH2" Port="22" />
     <Node Name="Windows" Type="Container">
       <Node Name="dc" Type="Connection" Hostname="dc.local" Domain="CORP" Username="admin" Protocol="RDP" Port="3390" />
     </Node>
@@ -494,8 +504,10 @@ mod tests {
         std::fs::write(&path, xml).unwrap();
         let mut store = SessionStore::default();
         let r = import_mremoteng(&mut store, &path).unwrap();
-        assert_eq!(r.sessions, 3);
+        assert_eq!(r.sessions, 4);
         assert_eq!(r.skipped, 1);
+        let web2 = store.sessions.iter().find(|s| s.name == "web2").unwrap();
+        assert_eq!(store.resolve(web2).username, "svc");
         assert_eq!(r.folders, 3);
         let web1 = store.sessions.iter().find(|s| s.name == "web1").unwrap();
         let servers = store.folders.iter().find(|f| f.name == "Servers").unwrap();
@@ -513,7 +525,7 @@ mod tests {
         // Re-import: everything is a duplicate, no new folders.
         let r2 = import_mremoteng(&mut store, &path).unwrap();
         assert_eq!(r2.sessions, 0);
-        assert_eq!(r2.duplicates, 3);
+        assert_eq!(r2.duplicates, 4);
         assert_eq!(r2.folders, 0);
         std::fs::remove_file(path).unwrap();
     }

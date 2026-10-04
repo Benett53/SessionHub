@@ -1,5 +1,6 @@
 // Minimal DOM helpers - no framework needed for an app of this size.
 import { t } from "./i18n";
+import { icon, type IconName } from "./icons";
 
 type Child = Node | string | null | undefined | false;
 type Attrs = Record<string, unknown> & { class?: string; style?: string };
@@ -173,62 +174,129 @@ export interface MenuItem {
   disabled?: boolean;
   danger?: boolean;
   separator?: boolean;
+  icon?: IconName;
+  /** Shows a check mark (toggle / radio items). */
+  checked?: boolean;
+  submenu?: MenuItem[];
 }
 
-let openMenu: HTMLElement | null = null;
+export const SEP: MenuItem = { separator: true, label: "" };
+
+const openMenus: HTMLElement[] = [];
+let menuCloseHook: (() => void) | null = null;
 
 export function closeMenu() {
-  openMenu?.remove();
-  openMenu = null;
+  while (openMenus.length) openMenus.pop()!.remove();
+  const hook = menuCloseHook;
+  menuCloseHook = null;
+  hook?.();
 }
 
-export function contextMenu(x: number, y: number, items: MenuItem[]) {
+function closeMenusAbove(level: number) {
+  while (openMenus.length > level) openMenus.pop()!.remove();
+}
+
+function buildMenu(items: MenuItem[], level: number): HTMLElement {
+  const menu = h("div", { class: "ctx-menu", role: "menu" });
+  for (const it of items) {
+    if (it.separator) {
+      menu.append(h("div", { class: "ctx-sep" }));
+      continue;
+    }
+    const btn = h(
+      "button",
+      {
+        class: `ctx-item${it.danger ? " danger" : ""}${it.submenu ? " has-sub" : ""}`,
+        disabled: it.disabled,
+        role: "menuitem",
+      },
+      h("span", { class: "ctx-icon" }, it.checked ? icon("ok", 14) : it.icon ? icon(it.icon, 14) : null),
+      h("span", { class: "ctx-label" }, it.label),
+      it.shortcut ? h("kbd", {}, it.shortcut) : null,
+      it.submenu ? h("span", { class: "ctx-arrow" }, icon("chevronRight", 14)) : null,
+    );
+    const openSub = () => {
+      if (!it.submenu || it.disabled) return;
+      closeMenusAbove(level + 1);
+      const sub = buildMenu(it.submenu, level + 1);
+      document.body.append(sub);
+      const r = btn.getBoundingClientRect();
+      const sr = sub.getBoundingClientRect();
+      let left = r.right - 2;
+      if (left + sr.width > window.innerWidth - 4) left = r.left - sr.width + 2;
+      sub.style.left = `${Math.max(4, left)}px`;
+      sub.style.top = `${Math.max(4, Math.min(r.top - 4, window.innerHeight - sr.height - 4))}px`;
+      openMenus.push(sub);
+    };
+    btn.addEventListener("mouseenter", () => {
+      if (it.submenu) openSub();
+      else closeMenusAbove(level + 1);
+    });
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (it.submenu) {
+        openSub();
+        (openMenus[level + 1]?.querySelector("button:not([disabled])") as HTMLButtonElement | null)?.focus();
+        return;
+      }
+      closeMenu();
+      it.action?.();
+    });
+    btn.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowRight" && it.submenu) {
+        openSub();
+        (openMenus[level + 1]?.querySelector("button:not([disabled])") as HTMLButtonElement | null)?.focus();
+        e.preventDefault();
+      } else if (e.key === "ArrowLeft" && level > 0) {
+        closeMenusAbove(level);
+        (openMenus[level - 1]?.querySelector(".has-sub:hover, .has-sub") as HTMLButtonElement | null)?.focus();
+        e.preventDefault();
+      }
+    });
+    menu.append(btn);
+  }
+  return menu;
+}
+
+/** Show a (nested) context menu. `onClose` runs when it disappears. */
+export function contextMenu(x: number, y: number, items: MenuItem[], onClose?: () => void) {
   closeMenu();
-  const menu = h(
-    "div",
-    { class: "ctx-menu", role: "menu" },
-    items.map((it) =>
-      it.separator
-        ? h("div", { class: "ctx-sep" })
-        : h(
-            "button",
-            {
-              class: `ctx-item${it.danger ? " danger" : ""}`,
-              disabled: it.disabled,
-              onclick: () => {
-                closeMenu();
-                it.action?.();
-              },
-            },
-            h("span", {}, it.label),
-            it.shortcut ? h("kbd", {}, it.shortcut) : null,
-          ),
-    ),
-  );
+  const menu = buildMenu(items, 0);
   document.body.append(menu);
   const r = menu.getBoundingClientRect();
-  menu.style.left = `${Math.min(x, window.innerWidth - r.width - 4)}px`;
-  menu.style.top = `${Math.min(y, window.innerHeight - r.height - 4)}px`;
-  openMenu = menu;
+  menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - r.width - 4))}px`;
+  menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - r.height - 4))}px`;
+  openMenus.push(menu);
+  menuCloseHook = onClose ?? null;
   menu.querySelector<HTMLButtonElement>("button:not([disabled])")?.focus();
 }
 
+export function isMenuOpen() {
+  return openMenus.length > 0;
+}
+
 document.addEventListener("mousedown", (e) => {
-  if (openMenu && !openMenu.contains(e.target as Node)) closeMenu();
+  if (openMenus.length && !openMenus.some((m) => m.contains(e.target as Node))) closeMenu();
 });
-document.addEventListener("keydown", (e) => {
-  if (!openMenu) return;
-  if (e.key === "Escape") {
-    closeMenu();
-    e.preventDefault();
-  } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-    const items = [...openMenu.querySelectorAll<HTMLButtonElement>("button:not([disabled])")];
-    const i = items.indexOf(document.activeElement as HTMLButtonElement);
-    const next = e.key === "ArrowDown" ? (i + 1) % items.length : (i - 1 + items.length) % items.length;
-    items[next]?.focus();
-    e.preventDefault();
-  }
-});
+document.addEventListener(
+  "keydown",
+  (e) => {
+    if (!openMenus.length) return;
+    if (e.key === "Escape") {
+      closeMenu();
+      e.preventDefault();
+      e.stopPropagation();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const current = (document.activeElement as HTMLElement)?.closest(".ctx-menu") ?? openMenus[openMenus.length - 1];
+      const items = [...current.querySelectorAll<HTMLButtonElement>("button:not([disabled])")];
+      const i = items.indexOf(document.activeElement as HTMLButtonElement);
+      const next = e.key === "ArrowDown" ? (i + 1) % items.length : (i - 1 + items.length) % items.length;
+      items[next]?.focus();
+      e.preventDefault();
+    }
+  },
+  true,
+);
 window.addEventListener("blur", closeMenu);
 
 // ------------------------------------------------------------- toasts ----

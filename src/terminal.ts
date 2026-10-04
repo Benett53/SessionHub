@@ -7,71 +7,22 @@ import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { Terminal, type ITheme } from "@xterm/xterm";
+import { Terminal } from "@xterm/xterm";
 
 import { api, errorText, sessionTitle, type ConnEvent, type PromptReply, type Session } from "./api";
+import { t, tb } from "./i18n";
+import { notify } from "./notifications";
 import { authPrompt, hostKeyPrompt } from "./prompts";
 import { state } from "./state";
-import { t, tb } from "./i18n";
-import { h, contextMenu, toast } from "./ui";
+import { nextTabKey, type Tab, type TabHost, type TabStatus } from "./tab";
+import { schemeById } from "./themes";
+import { confirmDialog, contextMenu, h, toast, SEP, type MenuItem } from "./ui";
 
-export type TabStatus = "connecting" | "connected" | "closed" | "error";
-
-export interface TabHost {
-  onTabChanged(tab: TerminalTab): void;
-  onTabInput(tab: TerminalTab, data: string): boolean;
-  closeTab(tab: TerminalTab): void;
-  duplicateTab(tab: TerminalTab): void;
-  isActive(tab: TerminalTab): boolean;
+/** Effective terminal colors for a session (session scheme > global > app theme). */
+export function schemeFor(session: Session | null) {
+  const id = session?.colorScheme || state.settings.terminalScheme || "auto";
+  return schemeById(id, isDarkTheme());
 }
-
-const DARK: ITheme = {
-  background: "#0d1117",
-  foreground: "#e6edf3",
-  cursor: "#58a6ff",
-  cursorAccent: "#0d1117",
-  selectionBackground: "#264f78",
-  black: "#484f58",
-  red: "#ff7b72",
-  green: "#3fb950",
-  yellow: "#d29922",
-  blue: "#58a6ff",
-  magenta: "#bc8cff",
-  cyan: "#39c5cf",
-  white: "#b1bac4",
-  brightBlack: "#6e7681",
-  brightRed: "#ffa198",
-  brightGreen: "#56d364",
-  brightYellow: "#e3b341",
-  brightBlue: "#79c0ff",
-  brightMagenta: "#d2a8ff",
-  brightCyan: "#56d4dd",
-  brightWhite: "#ffffff",
-};
-
-const LIGHT: ITheme = {
-  background: "#ffffff",
-  foreground: "#1f2328",
-  cursor: "#0969da",
-  cursorAccent: "#ffffff",
-  selectionBackground: "#b6d7ff",
-  black: "#24292f",
-  red: "#cf222e",
-  green: "#116329",
-  yellow: "#4d2d00",
-  blue: "#0969da",
-  magenta: "#8250df",
-  cyan: "#1b7c83",
-  white: "#6e7781",
-  brightBlack: "#57606a",
-  brightRed: "#a40e26",
-  brightGreen: "#1a7f37",
-  brightYellow: "#633c01",
-  brightBlue: "#218bff",
-  brightMagenta: "#a475f9",
-  brightCyan: "#3192aa",
-  brightWhite: "#8c959f",
-};
 
 export const DEFAULT_FONT =
   '"JetBrains Mono", "Cascadia Mono", "Fira Code", "Source Code Pro", "DejaVu Sans Mono", "Ubuntu Mono", "Liberation Mono", Consolas, "Noto Sans Mono", monospace';
@@ -82,10 +33,9 @@ export function isDarkTheme() {
   return theme !== "light";
 }
 
-let tabCounter = 0;
-
-export class TerminalTab {
-  readonly key = `tab-${++tabCounter}`;
+export class TerminalTab implements Tab {
+  readonly key = nextTabKey();
+  readonly kind = "terminal" as const;
   session: Session;
   title: string;
   /** Set when the user renamed the tab; then session edits keep the custom name. */
@@ -135,13 +85,14 @@ export class TerminalTab {
       cursorStyle: s.cursorStyle,
       cursorBlink: s.cursorBlink,
       scrollback: s.scrollback,
-      theme: isDarkTheme() ? DARK : LIGHT,
+      theme: schemeFor(session).theme,
       macOptionIsMeta: true,
       rightClickSelectsWord: false,
       drawBoldTextInBrightColors: true,
       minimumContrastRatio: 1,
       smoothScrollDuration: 0,
     });
+    this.el.style.setProperty("--term-bg", String(schemeFor(session).theme.background));
     this.term.loadAddon(this.fit);
     this.term.loadAddon(this.search);
     this.term.loadAddon(new Unicode11Addon());
@@ -238,9 +189,12 @@ export class TerminalTab {
     o.cursorStyle = s.cursorStyle;
     o.cursorBlink = s.cursorBlink;
     o.scrollback = s.scrollback;
-    o.theme = isDarkTheme() ? DARK : LIGHT;
+    o.theme = schemeFor(this.session).theme;
+    this.el.style.setProperty("--term-bg", String(o.theme.background));
     this.applyRenderer();
     this.fitNow();
+    // The GPU renderer does not always repaint visible rows on a theme change.
+    this.term.refresh(0, this.term.rows - 1);
   }
 
   // ------------------------------------------------------- connection ----
@@ -287,6 +241,7 @@ export class TerminalTab {
         this.term.write(`\x1b[2m${tb(ev.message).replace(/\r?\n/g, "\r\n")}\x1b[0m\r\n`);
         break;
       case "connected":
+        notify("success", t("Connected"), this.title);
         this.wasConnected = true;
         this.reconnectAttempts = 0;
         this.setStatus("connected", t("Connected"));
@@ -304,6 +259,7 @@ export class TerminalTab {
         break;
       }
       case "passwordSaved": {
+        notify("info", t("Password saved in the system keyring"), this.title);
         const stored = state.session(this.session.id);
         if (stored && !stored.savePassword) {
           try {
@@ -327,6 +283,7 @@ export class TerminalTab {
 
   private closed(reason: string, error: boolean) {
     this.connId = null;
+    notify(error ? "error" : "info", reason, this.title);
     this.setStatus(error ? "error" : "closed", reason);
     const color = error ? "31" : "33";
     this.term.write(`\r\n\x1b[${color}m[${reason}]\x1b[0m\r\n`);
@@ -374,6 +331,13 @@ export class TerminalTab {
     this.send(data);
   }
 
+  /** Send a snippet (through broadcast if active). */
+  sendSnippet(command: string, run: boolean) {
+    const data = run ? `${command.replace(/\r?\n$/, "")}\r` : command;
+    if (!this.host.onTabInput(this, data)) this.send(data);
+    this.focus();
+  }
+
   send(data: string) {
     if (this.connId && this.status === "connected") {
       api.write(this.connId, data).catch(() => undefined);
@@ -401,7 +365,8 @@ export class TerminalTab {
       return false;
     }
     // Let global shortcuts bubble to the app (see shortcuts in main.ts).
-    if (ctrlShift && ["KeyT", "KeyW", "KeyN", "KeyK", "KeyB", "KeyD", "KeyE"].includes(e.code)) return false;
+    if (ctrlShift && ["KeyT", "KeyW", "KeyN", "KeyK", "KeyB", "KeyD", "KeyE", "KeyP", "KeyO", "KeyS"].includes(e.code)) return false;
+    if (e.key === "F11" || (e.ctrlKey && e.key === ",")) return false;
     if (e.ctrlKey && (e.key === "Tab" || e.key === "PageUp" || e.key === "PageDown")) return false;
     if (e.altKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) return false;
     if (e.ctrlKey && !e.shiftKey && (e.key === "+" || e.key === "-" || e.key === "=" || e.key === "0")) return false;
@@ -414,29 +379,64 @@ export class TerminalTab {
   }
 
   async paste() {
+    let text = "";
     try {
-      const text = await readText();
-      if (text) this.term.paste(text);
+      text = await readText();
     } catch {
       // empty clipboard or non-text content
     }
+    if (text) await this.pasteText(text);
     this.focus();
+  }
+
+  /** Paste with a safety question for multi-line text (avoids running a pasted script by accident). */
+  async pasteText(text: string) {
+    const lines = text.replace(/\r?\n$/, "").split(/\r?\n/).length;
+    const limit = state.settings.pasteWarnLines;
+    if (limit > 0 && lines > limit) {
+      const preview = text.split(/\r?\n/).slice(0, 8).join("\n");
+      const ok = await confirmDialog(
+        t("Paste {0} lines?", String(lines)),
+        `${t("The clipboard contains several lines. Each line may be executed immediately.")}\n\n${preview}${lines > 8 ? "\n..." : ""}`,
+        t("Paste"),
+      );
+      if (!ok) return;
+    }
+    this.term.paste(text);
+  }
+
+  sizeText() {
+    return `${this.term.cols}\u00d7${this.term.rows}`;
+  }
+
+  menuItems(): MenuItem[] {
+    return this.session.protocol === "ssh"
+      ? [{ label: t("Open SFTP browser"), icon: "folderOpen", action: () => this.host.openSftp(this.session) }]
+      : [];
   }
 
   private showMenu(x: number, y: number) {
     const hasSel = this.term.hasSelection();
+    const snippets = state.settings.snippets;
     contextMenu(x, y, [
-      { label: t("Copy"), shortcut: "Ctrl+Shift+C", disabled: !hasSel, action: () => this.copy() },
-      { label: t("Paste"), shortcut: "Ctrl+Shift+V", action: () => this.paste() },
+      { label: t("Copy"), icon: "copy", shortcut: "Ctrl+Shift+C", disabled: !hasSel, action: () => this.copy() },
+      { label: t("Paste"), icon: "paste", shortcut: "Ctrl+Shift+V", action: () => this.paste() },
       { label: t("Select all"), action: () => this.term.selectAll() },
-      { separator: true, label: "" },
-      { label: t("Find ..."), shortcut: "Ctrl+Shift+F", action: () => this.openSearch() },
+      SEP,
+      {
+        label: t("Snippets"),
+        icon: "snippet",
+        disabled: !snippets.length,
+        submenu: snippets.map((sn) => ({ label: sn.name, action: () => this.sendSnippet(sn.command, sn.run) })),
+      },
+      { label: t("Find ..."), icon: "search", shortcut: "Ctrl+Shift+F", action: () => this.openSearch() },
       { label: t("Clear scrollback"), action: () => this.term.clear() },
       { label: t("Reset terminal"), action: () => this.term.reset() },
-      { separator: true, label: "" },
-      { label: t("Duplicate session"), action: () => this.host.duplicateTab(this) },
-      { label: t("Reconnect"), action: () => this.reconnect() },
-      { label: t("Close"), shortcut: "Ctrl+Shift+W", danger: true, action: () => this.host.closeTab(this) },
+      SEP,
+      ...this.menuItems(),
+      { label: t("Duplicate session"), shortcut: "Ctrl+Shift+D", action: () => this.host.duplicateTab(this) },
+      { label: t("Reconnect"), icon: "refresh", action: () => this.reconnect() },
+      { label: t("Close"), icon: "close", shortcut: "Ctrl+Shift+W", danger: true, action: () => this.host.closeTab(this) },
     ]);
   }
 

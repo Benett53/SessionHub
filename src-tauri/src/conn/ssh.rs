@@ -109,7 +109,7 @@ fn hop_chain(ctx: &Ctx) -> Result<Vec<Session>> {
         let hop = ctx
             .store
             .session(&id)
-            .cloned()
+            .map(|s| ctx.store.resolve(s))
             .ok_or_else(|| anyhow!("jump host session no longer exists"))?;
         if chain.iter().any(|s| s.id == hop.id) {
             bail!("jump host loop detected at '{}'", hop.display_name());
@@ -121,8 +121,10 @@ fn hop_chain(ctx: &Ctx) -> Result<Vec<Session>> {
     Ok(chain)
 }
 
-pub async fn run(mut ctx: Ctx) -> Result<String> {
-    let chain = hop_chain(&ctx)?;
+/// Connect and authenticate through the whole jump host chain.
+/// Returns the target handle plus the jump host handles (keep them alive).
+pub async fn establish(ctx: &mut Ctx) -> Result<(Arc<Handle<Client>>, Vec<Handle<Client>>)> {
+    let chain = hop_chain(ctx)?;
     let mut hops: Vec<Handle<Client>> = Vec::new();
     let mut handle: Option<Handle<Client>> = None;
 
@@ -138,7 +140,7 @@ pub async fn run(mut ctx: Ctx) -> Result<String> {
             prompter: ctx.prompter.clone(),
             events: ctx.events.clone(),
         };
-        let cfg = config(&ctx, hop);
+        let cfg = config(ctx, hop);
         let mut h = match handle.take() {
             None => {
                 ctx.status(format!("Connecting to {}:{} ...", client.host, port));
@@ -166,10 +168,14 @@ pub async fn run(mut ctx: Ctx) -> Result<String> {
             }
         };
         let password = if i == last { ctx.password.take() } else { None };
-        authenticate(&mut h, hop, password, &ctx).await?;
+        authenticate(&mut h, hop, password, ctx).await?;
         handle = Some(h);
     }
-    let handle = Arc::new(handle.expect("chain is never empty"));
+    Ok((Arc::new(handle.expect("chain is never empty")), hops))
+}
+
+pub async fn run(mut ctx: Ctx) -> Result<String> {
+    let (handle, hops) = establish(&mut ctx).await?;
     let session = ctx.session.clone();
 
     ctx.status("Opening shell ...");
@@ -286,7 +292,8 @@ async fn authenticate(h: &mut Handle<Client>, session: &Session, password: Optio
     let (password, password_from_keyring) = match password {
         Some(p) => (Some(p), false),
         None if session.save_password => {
-            let p = secrets::get(Kind::Password, &session.id);
+            let owner = session.password_from.as_deref().unwrap_or(&session.id);
+            let p = secrets::get(Kind::Password, owner);
             let found = p.is_some();
             (p, found)
         }

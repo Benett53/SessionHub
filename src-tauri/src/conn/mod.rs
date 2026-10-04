@@ -8,6 +8,7 @@
 mod known_hosts;
 mod local;
 mod serial;
+pub mod sftp;
 mod ssh;
 mod telnet;
 
@@ -177,6 +178,7 @@ struct ConnHandle {
 pub struct ConnManager {
     conns: Mutex<HashMap<String, ConnHandle>>,
     pending: PendingPrompts,
+    sftp: Mutex<HashMap<String, Arc<sftp::SftpConn>>>,
 }
 
 pub struct ConnectParams {
@@ -192,6 +194,61 @@ pub struct ConnectParams {
 }
 
 impl ConnManager {
+    fn make_ctx(&self, id: &str, p: ConnectParams, log: Option<File>) -> (Ctx, mpsc::UnboundedSender<ConnCmd>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let ctx = Ctx {
+            prompter: Prompter {
+                conn_id: id.to_string(),
+                events: p.on_event.clone(),
+                pending: self.pending.clone(),
+            },
+            out: Output {
+                channel: p.on_data,
+                log,
+            },
+            events: p.on_event,
+            session: p.session,
+            password: p.password,
+            settings: p.settings,
+            store: p.store,
+            cols: p.cols.max(1),
+            rows: p.rows.max(1),
+            rx,
+        };
+        (ctx, tx)
+    }
+
+    /// Runs `fut` as the task of connection `id` and reports how it ended.
+    fn spawn_conn<F>(
+        self: &Arc<Self>,
+        id: String,
+        tx: mpsc::UnboundedSender<ConnCmd>,
+        events: Channel<ConnEvent>,
+        fut: F,
+    ) where
+        F: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        self.conns.lock().insert(id.clone(), ConnHandle { tx, task: None });
+        let mgr = self.clone();
+        let conn_id = id.clone();
+        let task = tauri::async_runtime::spawn(async move {
+            let event = match fut.await {
+                Ok(reason) => ConnEvent::Closed { reason, error: false },
+                Err(e) => ConnEvent::Closed {
+                    reason: format!("{e:#}"),
+                    error: true,
+                },
+            };
+            let _ = events.send(event);
+            mgr.conns.lock().remove(&conn_id);
+            mgr.pending.lock().remove(&conn_id);
+            mgr.sftp.lock().remove(&conn_id);
+        });
+        if let Some(h) = self.conns.lock().get_mut(&id) {
+            h.task = Some(task.inner().abort_handle());
+        }
+    }
+
     pub fn open(self: &Arc<Self>, p: ConnectParams) -> Result<String> {
         anyhow::ensure!(
             p.session.protocol.is_terminal(),
@@ -199,7 +256,6 @@ impl ConnManager {
             p.session.protocol
         );
         let id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = mpsc::unbounded_channel();
 
         let log = if p.session.log_output {
             match open_log(&p.log_dir, &p.session) {
@@ -216,56 +272,39 @@ impl ConnManager {
             None
         };
 
-        let ctx = Ctx {
-            prompter: Prompter {
-                conn_id: id.clone(),
-                events: p.on_event.clone(),
-                pending: self.pending.clone(),
-            },
-            out: Output {
-                channel: p.on_data,
-                log,
-            },
-            events: p.on_event.clone(),
-            session: p.session,
-            password: p.password,
-            settings: p.settings,
-            store: p.store,
-            cols: p.cols.max(1),
-            rows: p.rows.max(1),
-            rx,
-        };
-
-        self.conns.lock().insert(id.clone(), ConnHandle { tx, task: None });
-
-        let mgr = self.clone();
-        let conn_id = id.clone();
-        let events = p.on_event;
-        let task = tauri::async_runtime::spawn(async move {
-            let protocol = ctx.session.protocol;
-            let result = match protocol {
+        let events = p.on_event.clone();
+        let (ctx, tx) = self.make_ctx(&id, p, log);
+        let fut = async move {
+            match ctx.session.protocol {
                 Protocol::Ssh => ssh::run(ctx).await,
                 Protocol::Telnet => telnet::run(ctx, true).await,
                 Protocol::Raw => telnet::run(ctx, false).await,
                 Protocol::Local => local::run(ctx).await,
                 Protocol::Serial => serial::run(ctx).await,
                 Protocol::Rdp | Protocol::Vnc => unreachable!(),
-            };
-            let event = match result {
-                Ok(reason) => ConnEvent::Closed { reason, error: false },
-                Err(e) => ConnEvent::Closed {
-                    reason: format!("{e:#}"),
-                    error: true,
-                },
-            };
-            let _ = events.send(event);
-            mgr.conns.lock().remove(&conn_id);
-            mgr.pending.lock().remove(&conn_id);
-        });
-        if let Some(h) = self.conns.lock().get_mut(&id) {
-            h.task = Some(task.inner().abort_handle());
-        }
+            }
+        };
+        self.spawn_conn(id.clone(), tx, events, fut);
         Ok(id)
+    }
+
+    /// Open an SFTP session; it is usable once `ConnEvent::Connected` arrives.
+    pub fn open_sftp(self: &Arc<Self>, p: ConnectParams) -> Result<String> {
+        anyhow::ensure!(p.session.protocol == Protocol::Ssh, "SFTP needs an SSH session");
+        let id = uuid::Uuid::new_v4().to_string();
+        let events = p.on_event.clone();
+        let (ctx, tx) = self.make_ctx(&id, p, None);
+        let fut = sftp::run(ctx, self.clone(), id.clone());
+        self.spawn_conn(id.clone(), tx, events, fut);
+        Ok(id)
+    }
+
+    pub fn sftp(&self, id: &str) -> Result<Arc<sftp::SftpConn>> {
+        self.sftp
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("SFTP connection is closed"))
     }
 
     pub fn send(&self, id: &str, cmd: ConnCmd) -> Result<()> {
