@@ -77,7 +77,10 @@ Der Aufbau orientiert sich an **mRemoteNG**, ist aber moderner und aufgeräumter
 
 ## Installation
 
-Fertige Pakete entstehen über GitHub Actions, sobald ein Tag `v*` gepusht wird (siehe *Releases*).
+**[⬇ Neueste Version herunterladen](https://github.com/baba537/SessionHub/releases/latest)**
+
+Die Pakete werden automatisch von GitHub Actions gebaut, sobald ein Tag `v*` gepusht wird
+(neue Version: `version` in `src-tauri/tauri.conf.json` erhöhen, dann z. B. `git tag v0.2.0 && git push origin v0.2.0`).
 
 | System | Paket |
 |---|---|

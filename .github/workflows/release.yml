@@ -1,7 +1,8 @@
 name: Release
 
-# Push a tag like v0.2.0 to build installers for Linux and Windows and
-# attach them to a draft GitHub release.
+# Push a tag like v0.2.0 (or start the workflow manually) to build the
+# installers for Linux and Windows and publish them as a GitHub release.
+# The version comes from src-tauri/tauri.conf.json.
 on:
   push:
     tags: ["v*"]
@@ -12,14 +13,17 @@ permissions:
 
 jobs:
   build:
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
           # Oldest supported Ubuntu -> AppImage/deb run on every distro with glibc >= 2.35.
-          - os: ubuntu-22.04
+          - name: Linux
+            os: ubuntu-22.04
             args: --bundles deb,rpm,appimage
-          - os: windows-latest
+          - name: Windows
+            os: windows-latest
             args: --bundles nsis,msi
     runs-on: ${{ matrix.os }}
     steps:
@@ -29,7 +33,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf rpm libfuse2
 
       - uses: actions/setup-node@v4
         with:
@@ -48,9 +52,25 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: SessionHub ${{ github.ref_name }}
-          releaseBody: See CHANGELOG / commit history for details.
-          releaseDraft: true
+          tagName: v__VERSION__
+          releaseName: SessionHub v__VERSION__
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+          releaseBody: |
+            ## Download
+
+            | System | Datei |
+            |---|---|
+            | **Linux (alle Distributionen)** | `SessionHub_*_amd64.AppImage` – herunterladen, ausführbar machen (`chmod +x`), starten |
+            | Debian, Ubuntu, Linux Mint, Pop!_OS | `SessionHub_*_amd64.deb` – `sudo apt install ./SessionHub_*_amd64.deb` |
+            | Fedora, openSUSE | `SessionHub-*.x86_64.rpm` – `sudo dnf install ./SessionHub-*.x86_64.rpm` |
+            | **Windows 10/11** | `SessionHub_*_x64-setup.exe` (Installer) oder `SessionHub_*_x64_en-US.msi` |
+
+            **Linux:** benötigt WebKitGTK 4.1 (Ubuntu 22.04+, Debian 12+, Fedora 37+, Arch, openSUSE Leap 15.5+).
+            Gespeicherte Passwörter nutzen den System-Schlüsselbund (GNOME Keyring, KWallet, KeePassXC).
+
+            **Windows:** Die Installer sind nicht signiert. SmartScreen fragt deshalb beim ersten Start nach –
+            „Weitere Informationen“ → „Trotzdem ausführen“.
+
+            Details und Funktionen: siehe [README](https://github.com/${{ github.repository }}#readme).
