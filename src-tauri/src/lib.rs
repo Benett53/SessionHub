@@ -1,6 +1,7 @@
 mod conn;
 mod external;
 mod importers;
+mod keys;
 mod model;
 mod secrets;
 mod store;
@@ -16,12 +17,18 @@ use tauri::{Manager, State};
 
 use conn::{ConnCmd, ConnEvent, ConnManager, ConnectParams, PromptReply};
 use model::{Folder, Session, SessionStore, Settings};
+use secrets::Secret;
 use store::Paths;
 
 type CmdResult<T> = Result<T, String>;
 
 fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
+}
+
+/// Passwords arriving from the frontend: empty = none, wiped from memory on drop.
+fn secret(password: Option<String>) -> Option<Secret> {
+    password.map(Secret::new).filter(|p| !p.is_empty())
 }
 
 pub struct AppState {
@@ -121,8 +128,8 @@ fn save_session(state: State<'_, AppState>, mut session: Session, password: Opti
     }
     // Keyring first: if it fails the user gets an error and nothing is half-saved.
     if session.save_password {
-        if let Some(pw) = password.as_deref().filter(|p| !p.is_empty()) {
-            secrets::set(secrets::Kind::Password, &session.id, pw).map_err(err)?;
+        if let Some(pw) = secret(password) {
+            secrets::set(secrets::Kind::Password, &session.id, &pw).map_err(err)?;
         }
     } else {
         secrets::delete(secrets::Kind::Password, &session.id);
@@ -156,8 +163,8 @@ fn save_folder(state: State<'_, AppState>, mut folder: Folder, password: Option<
         folder.id = uuid::Uuid::new_v4().to_string();
     }
     if folder.save_password {
-        if let Some(pw) = password.as_deref().filter(|p| !p.is_empty()) {
-            secrets::set(secrets::Kind::Password, &folder.id, pw).map_err(err)?;
+        if let Some(pw) = secret(password) {
+            secrets::set(secrets::Kind::Password, &folder.id, &pw).map_err(err)?;
         }
     } else {
         secrets::delete(secrets::Kind::Password, &folder.id);
@@ -268,7 +275,7 @@ async fn connect(
     state.touch(&session.id);
     let params = ConnectParams {
         session,
-        password: password.filter(|p| !p.is_empty()),
+        password: secret(password),
         settings,
         store,
         log_dir,
@@ -293,7 +300,7 @@ async fn sftp_open(
     let session = store.resolve(&session);
     let params = ConnectParams {
         session,
-        password: password.filter(|p| !p.is_empty()),
+        password: secret(password),
         settings,
         store,
         log_dir: PathBuf::new(),
@@ -368,56 +375,67 @@ fn sftp_cancel(state: State<'_, AppState>, id: String, transfer: String) {
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Reachability {
-    id: String,
-    reachable: bool,
-    millis: u64,
+/// Identify the remote system of a connected SSH terminal.
+#[tauri::command]
+async fn detect_device(state: State<'_, AppState>, id: String) -> CmdResult<conn::DeviceInfo> {
+    state.conns.detect(&id).await.map_err(err)
 }
 
-/// TCP connect check for many sessions in parallel (mRemoteNG "port scan" light).
+// ------------------------------------------------------------ SSH keys ----
+
 #[tauri::command]
-async fn check_reachable(state: State<'_, AppState>, ids: Vec<String>) -> CmdResult<Vec<Reachability>> {
-    let store = state.store.lock().clone();
-    let mut tasks = Vec::new();
-    for id in ids.into_iter().take(500) {
-        let Some(s) = store.session(&id) else { continue };
-        let host = s.host.trim().to_string();
-        let port = s.effective_port();
-        if host.is_empty() || port == 0 {
-            continue;
-        }
-        tasks.push(tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            let ok = matches!(
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    tokio::net::TcpStream::connect((host.as_str(), port))
-                )
-                .await,
-                Ok(Ok(_))
-            );
-            Reachability {
-                id,
-                reachable: ok,
-                millis: start.elapsed().as_millis() as u64,
+async fn list_keys() -> Vec<keys::KeyInfo> {
+    tokio::task::spawn_blocking(keys::list).await.unwrap_or_default()
+}
+
+#[tauri::command]
+async fn generate_key(
+    name: String,
+    kind: String,
+    comment: String,
+    passphrase: Option<String>,
+    save_passphrase: bool,
+) -> CmdResult<keys::KeyInfo> {
+    // RSA generation takes a moment: keep it off the async runtime.
+    tokio::task::spawn_blocking(move || keys::generate(&name, &kind, &comment, secret(passphrase), save_passphrase))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(err)
+}
+
+#[tauri::command]
+fn delete_key(path: String) -> CmdResult<()> {
+    keys::delete(&path).map_err(err)
+}
+
+#[tauri::command]
+fn forget_key_passphrase(path: String) {
+    keys::forget_passphrase(&path);
+}
+
+/// Append the public key of `key_path` to `~/.ssh/authorized_keys` on the
+/// server of the connected SSH terminal `id` (like `ssh-copy-id`).
+#[tauri::command]
+async fn install_public_key(state: State<'_, AppState>, id: String, key_path: String) -> CmdResult<()> {
+    let line = keys::public_key_line(&key_path).map_err(err)?;
+    let res = state
+        .conns
+        .exec(&id, &keys::install_command(&line))
+        .await
+        .map_err(err)?;
+    if res.output.contains("SESSIONHUB_KEY_OK") {
+        Ok(())
+    } else {
+        let detail: String = res.output.trim().chars().take(300).collect();
+        Err(format!(
+            "the server did not accept the key (needs a POSIX shell with ~/.ssh/authorized_keys){}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
             }
-        }));
+        ))
     }
-    let mut out = Vec::new();
-    for t in tasks {
-        if let Ok(r) = t.await {
-            out.push(r);
-        }
-    }
-    Ok(out)
-}
-
-#[tauri::command]
-fn run_external_tool(state: State<'_, AppState>, session: Session, command: String) -> CmdResult<()> {
-    let session = state.store.lock().resolve(&session);
-    external::run_tool(&command, &session).map_err(err)
 }
 
 #[tauri::command]
@@ -459,7 +477,7 @@ fn prompt_reply(state: State<'_, AppState>, id: String, reply: PromptReply) -> C
 fn launch_external(state: State<'_, AppState>, session: Session, password: Option<String>) -> CmdResult<()> {
     let session = state.store.lock().resolve(&session);
     state.touch(&session.id);
-    let password = password.filter(|p| !p.is_empty()).or_else(|| {
+    let password = secret(password).or_else(|| {
         let owner = session.password_from.as_deref().unwrap_or(&session.id);
         session
             .save_password
@@ -565,8 +583,12 @@ pub fn run() {
             sftp_download,
             sftp_upload,
             sftp_cancel,
-            check_reachable,
-            run_external_tool,
+            detect_device,
+            list_keys,
+            generate_key,
+            delete_key,
+            forget_key_passphrase,
+            install_public_key,
             list_serial_ports,
             list_shells,
             import_sessions,

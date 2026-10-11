@@ -1,6 +1,6 @@
 [package]
 name = "sessionhub"
-version = "0.1.0"
+version = "0.2.0"
 description = "SessionHub - cross-platform SSH / Telnet / Serial / Shell session manager"
 authors = ["SessionHub contributors"]
 edition = "2021"
@@ -8,7 +8,9 @@ rust-version = "1.89"
 
 [lib]
 name = "sessionhub_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop only: staticlib/cdylib are only needed for Tauri mobile targets
+# (and the cdylib exceeds the export limit of the MinGW linker).
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -42,6 +44,10 @@ hmac = "0.12"
 sha1 = "0.10"
 data-encoding = "2"
 russh-sftp = "3"
+# Key generation (same version as russh uses internally).
+rand = { version = "0.10", features = ["thread_rng"] }
+# Wipe passwords from memory when they are dropped.
+zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

@@ -43,6 +43,7 @@ export interface Session {
   favorite: boolean;
   colorScheme: string;
   lastUsed: number;
+  deviceType: string;
 }
 
 export interface Folder {
@@ -63,13 +64,6 @@ export interface Snippet {
   name: string;
   command: string;
   run: boolean;
-}
-
-export interface ExternalTool {
-  id: string;
-  name: string;
-  command: string;
-  inTerminal: boolean;
 }
 
 export interface SessionStore {
@@ -103,8 +97,8 @@ export interface Settings {
   sidebarWidth: number;
   terminalScheme: string;
   snippets: Snippet[];
-  externalTools: ExternalTool[];
   pasteWarnLines: number;
+  detectDevice: boolean;
 }
 
 export interface Paths {
@@ -166,10 +160,25 @@ export interface Progress {
   total: number;
 }
 
-export interface Reachability {
-  id: string;
-  reachable: boolean;
-  millis: number;
+export interface DeviceInfo {
+  family: "linux" | "macos" | "bsd" | "windows" | "cisco" | "junos" | "routeros" | "unknown";
+  name: string;
+  distro: string;
+  arch: string;
+  pkg: string;
+  features: string[];
+  model: string;
+}
+
+export interface KeyInfo {
+  name: string;
+  path: string;
+  algorithm: string;
+  fingerprint: string;
+  comment: string;
+  encrypted: boolean;
+  passphraseSaved: boolean;
+  publicKey: string;
 }
 
 export interface PortInfo {
@@ -221,8 +230,13 @@ export const api = {
   sftpUpload: (id: string, local: string, remote: string, transfer: string, onProgress: Channel<Progress>) =>
     invoke<void>("sftp_upload", { id, local, remote, transfer, onProgress }),
   sftpCancel: (id: string, transfer: string) => invoke<void>("sftp_cancel", { id, transfer }),
-  checkReachable: (ids: string[]) => invoke<Reachability[]>("check_reachable", { ids }),
-  runExternalTool: (session: Session, command: string) => invoke<void>("run_external_tool", { session, command }),
+  detectDevice: (id: string) => invoke<DeviceInfo>("detect_device", { id }),
+  listKeys: () => invoke<KeyInfo[]>("list_keys"),
+  generateKey: (name: string, kind: "ed25519" | "rsa", comment: string, passphrase: string | null, savePassphrase: boolean) =>
+    invoke<KeyInfo>("generate_key", { name, kind, comment, passphrase, savePassphrase }),
+  deleteKey: (path: string) => invoke<void>("delete_key", { path }),
+  forgetKeyPassphrase: (path: string) => invoke<void>("forget_key_passphrase", { path }),
+  installPublicKey: (id: string, keyPath: string) => invoke<void>("install_public_key", { id, keyPath }),
   listSerialPorts: () => invoke<PortInfo[]>("list_serial_ports"),
   listShells: () => invoke<ShellInfo[]>("list_shells"),
   importSessions: (kind: "mremoteng" | "putty" | "sshconfig" | "json", path: string | null) =>
@@ -264,6 +278,7 @@ export function newSession(partial: Partial<Session> = {}): Session {
     favorite: false,
     colorScheme: "",
     lastUsed: 0,
+    deviceType: "",
     ...partial,
   };
 }

@@ -2,21 +2,19 @@ import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { api, errorText, newSession, sessionTitle, type Protocol, type Session } from "./api";
-import { editSession, editSettings, importExport, runImport, setConnectHook, showShortcuts } from "./dialogs";
-import { splitWords } from "./util";
+import { editFolder, editSession, editSettings, importExport, PROTOCOL_LABELS, setConnectHook, showShortcuts } from "./dialogs";
 import { initI18n, t } from "./i18n";
 import { icon, protocolIcon, type IconName } from "./icons";
-import { notify, NotificationPanel, onNotify, unreadCount } from "./notifications";
+import { keyManager } from "./keys";
+import { notify } from "./notifications";
 import { openPalette, type Action } from "./palette";
-import { PropertyGrid, PROTOCOL_LABELS } from "./propgrid";
 import { StartPage } from "./startpage";
 import { state } from "./state";
 import { isDarkTheme, TerminalTab } from "./terminal";
 import { SessionTree } from "./tree";
-import { closeMenu, confirmDialog, contextMenu, h, isModalOpen, SEP, toast, type MenuItem } from "./ui";
+import { confirmDialog, contextMenu, h, isModalOpen, SEP, toast, type MenuItem } from "./ui";
 import { Workspace, type Layout } from "./workspace";
 
 const HISTORY_KEY = "sessionhub.quickconnect";
@@ -24,7 +22,8 @@ const HISTORY_KEY = "sessionhub.quickconnect";
 function loadHistory(): string[] {
   try {
     const v = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
-    return Array.isArray(v) ? v.filter((x) => typeof x === "string").slice(0, 25) : [];
+    // Never keep entries that look like they contain a password (user:pass@host).
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string" && !hasInlinePassword(x)).slice(0, 25) : [];
   } catch {
     return [];
   }
@@ -39,6 +38,11 @@ function pushHistory(entry: string) {
   }
 }
 
+/** `user:secret@host` - passwords must never end up in the history or a session name. */
+function hasInlinePassword(text: string): boolean {
+  return /^(?:[a-z]+:\/\/)?[^@\s/]*:[^@\s]*@/i.test(text.trim());
+}
+
 /**
  * Quick connect syntax:
  *   [proto://][user@]host[:port]   proto = ssh | telnet | raw | rdp | vnc
@@ -47,7 +51,7 @@ function pushHistory(entry: string) {
  */
 export function parseQuickConnect(input: string, defaultProtocol: Protocol = "ssh"): Session | null {
   const text = input.trim();
-  if (!text) return null;
+  if (!text || hasInlinePassword(text)) return null;
   const saved = state.store.sessions.find((s) => s.name.toLowerCase() === text.toLowerCase());
   if (saved) return saved;
   const serial = text.match(/^((?:\/dev\/\S+)|(?:COM\d+))(?:\s+(\d+))?$/i);
@@ -93,7 +97,7 @@ async function main() {
     newSession: () => newConnection(),
     localShell: () => ws.openLocal(),
     importSessions: () => importExport(),
-    palette: () => palette(),
+    keys: () => keyManager(),
     connect: (s) => connect(s),
     shortcuts: () => showShortcuts(),
   });
@@ -102,51 +106,22 @@ async function main() {
   const connect = (s: Session, password: string | null = null) => ws.open(s, password);
   setConnectHook(connect);
 
-  const newConnection = (folder?: string | null, preset: Partial<Session> = {}) => {
+  /** Folder for new items: the selected folder or the folder of the selected session. */
+  const selectedFolder = () => {
     const sel = state.selection[0];
-    const target =
-      folder !== undefined ? folder : sel?.startsWith("f:") ? sel.slice(2) : sel?.startsWith("s:") ? (state.session(sel.slice(2))?.folder ?? null) : null;
-    return editSession(null, target, preset);
+    return sel?.startsWith("f:") ? sel.slice(2) : sel?.startsWith("s:") ? (state.session(sel.slice(2))?.folder ?? null) : null;
   };
+  const newConnection = (folder?: string | null, preset: Partial<Session> = {}) => editSession(null, folder !== undefined ? folder : selectedFolder(), preset);
 
-  const checkReachable = async (ids: string[]) => {
-    if (!ids.length) return;
-    notify("info", t("Checking {0} connections ...", String(ids.length)), t("Reachability"));
-    try {
-      const res = await api.checkReachable(ids);
-      state.setReachability(res);
-      const down = res.filter((r) => !r.reachable).length;
-      notify(down ? "warning" : "success", t("{0} reachable, {1} not reachable", String(res.length - down), String(down)), t("Reachability"), { toast: true });
-    } catch (e) {
-      notify("error", errorText(e), t("Reachability"), { toast: true });
-    }
-  };
-
-  const runTool = async (s: Session, toolId: string) => {
-    const tool = state.settings.externalTools.find((x) => x.id === toolId);
-    if (!tool) return;
-    const user = s.username || state.inherited(s.folder, "username")?.value || "";
-    const expand = (w: string) =>
-      w
-        .replaceAll("{host}", s.host)
-        .replaceAll("{port}", String(s.port || ({ ssh: 22, telnet: 23, rdp: 3389, vnc: 5900 } as Record<string, number>)[s.protocol] || 0))
-        .replaceAll("{user}", user)
-        .replaceAll("{name}", sessionTitle(s))
-        .replaceAll("{protocol}", s.protocol);
-    try {
-      if (/^https?:\/\//i.test(tool.command.trim())) {
-        await openUrl(expand(tool.command.trim()));
-      } else if (tool.inTerminal) {
-        const argv = splitWords(tool.command).map(expand).filter(Boolean);
-        if (!argv.length) return;
-        ws.open(newSession({ protocol: "local", name: `${tool.name}: ${sessionTitle(s)}`, shell: argv[0], shellArgs: argv.slice(1) }));
-      } else {
-        await api.runExternalTool(s, tool.command);
-      }
-      notify("info", `${tool.name}`, sessionTitle(s));
-    } catch (e) {
-      notify("error", errorText(e), tool.name, { toast: true });
-    }
+  // Keep a quick connection: save it and attach the open tab to the new entry.
+  ws.onSaveTab = async (tab) => {
+    const saved = await editSession({ ...structuredClone(tab.session), id: "", folder: selectedFolder() }, null, {}, { saveOnly: true });
+    if (!saved) return;
+    tab.session = structuredClone(saved);
+    if (!tab.customTitle) tab.title = sessionTitle(saved);
+    ws.renderAll();
+    updateStatus();
+    toast(t("Connection saved."), "success");
   };
 
   const treePanel = h("section", { class: "tree-panel" });
@@ -155,6 +130,7 @@ async function main() {
     openSftp: (s) => ws.openSftp(s),
     edit: (s) => editSession(s),
     newSession: (folder) => newConnection(folder),
+    editFolder: (f) => editFolder(f),
     duplicate: async (s) => {
       try {
         const copy = await api.saveSession({ ...structuredClone(s), id: "", name: `${s.name} (2)`, savePassword: false, lastUsed: 0 }, null);
@@ -164,18 +140,13 @@ async function main() {
         notify("error", errorText(e), "", { toast: true });
       }
     },
-    runTool,
-    checkReachable,
   });
-  const grid = new PropertyGrid((s) => editSession(s));
-  const notes = new NotificationPanel(() => ws.active?.fitNow());
 
   // ----------------------------------------------------------- layout ----
-  const sideSplit = h("div", { class: "hsplit", title: t("Drag to resize") });
-  const sidebar = h("aside", { class: "sidebar" }, treePanel, sideSplit, grid.el);
+  const sidebar = h("aside", { class: "sidebar" }, treePanel);
   const resizer = h("div", { class: "resizer", title: t("Drag to resize") });
   const center = h("div", { class: "center" }, workspaceEl, startPage.el);
-  const mainEl = h("main", { class: "main" }, center, notes.el);
+  const mainEl = h("main", { class: "main" }, center);
   const body = h("div", { class: "body" }, sidebar, resizer, mainEl);
 
   // ---------------------------------------------------------- actions ----
@@ -194,19 +165,15 @@ async function main() {
     zoomTimer = window.setTimeout(() => state.saveSettings({ ...state.settings }).catch(() => undefined), 600);
   };
   const setTheme = (theme: "dark" | "light" | "system") => state.saveSettings({ ...state.settings, theme }).catch((e) => toast(errorText(e), "error"));
-  const panels = {
-    sidebar: localStorage.getItem("sessionhub.panel.sidebar") !== "0",
-    props: localStorage.getItem("sessionhub.panel.props") !== "0",
-  };
-  const applyPanels = () => {
-    body.classList.toggle("no-sidebar", !panels.sidebar);
-    sidebar.classList.toggle("no-props", !panels.props);
+  let showSidebar = localStorage.getItem("sessionhub.panel.sidebar") !== "0";
+  const applySidebar = () => {
+    body.classList.toggle("no-sidebar", !showSidebar);
     requestAnimationFrame(() => ws.allTabs().forEach((x) => x.fitNow()));
   };
-  const togglePanel = (p: keyof typeof panels) => {
-    panels[p] = !panels[p];
-    store(`sessionhub.panel.${p}`, panels[p] ? "1" : "0");
-    applyPanels();
+  const toggleSidebar = () => {
+    showSidebar = !showSidebar;
+    store("sessionhub.panel.sidebar", showSidebar ? "1" : "0");
+    applySidebar();
   };
   const selectedSession = () => {
     const k = state.selection[0];
@@ -218,31 +185,32 @@ async function main() {
     if (s?.protocol === "ssh") ws.openSftp(s);
     else toast(t("Select an SSH connection first."), "info");
   };
-  const sendSnippet = (command: string, run: boolean) => {
+  const activeTerminal = () => {
     const tab = ws.active;
-    if (tab instanceof TerminalTab && tab.connected) tab.sendSnippet(command, run);
+    return tab instanceof TerminalTab && tab.connected ? tab : null;
+  };
+  const sendSnippet = (command: string, run: boolean) => {
+    const tab = activeTerminal();
+    if (tab) tab.sendSnippet(command, run);
     else toast(t("Open a connected terminal first."), "info");
   };
 
   const actions: Action[] = [
     { id: "new", label: t("New connection ..."), icon: "plus", shortcut: "Ctrl+Shift+N", run: () => newConnection() },
-    { id: "newFolder", label: t("New folder ..."), icon: "newFolder", run: () => tree.newFolder(null) },
+    { id: "newFolder", label: t("New folder ..."), icon: "newFolder", run: () => tree.newFolder(selectedFolder()) },
     { id: "local", label: t("New local shell"), icon: "prompt", shortcut: "Ctrl+Shift+T", run: () => ws.openLocal() },
     { id: "sftp", label: t("Open SFTP browser"), icon: "folderOpen", shortcut: "Ctrl+Shift+O", run: sftpForCurrent },
     { id: "quick", label: t("Quick connect"), icon: "zap", shortcut: "Ctrl+Shift+K", run: () => quickInput.focus() },
+    { id: "keys", label: t("SSH keys ..."), icon: "key", keywords: "ssh-keygen public private key", run: () => keyManager() },
     { id: "import", label: t("Import / Export ..."), icon: "download", keywords: "mremoteng putty ssh config json", run: () => importExport() },
     { id: "settings", label: t("Settings ..."), icon: "settings", shortcut: "Ctrl+,", run: () => editSettings() },
-    { id: "snippets", label: t("Manage snippets ..."), icon: "snippet", run: () => editSettings("snippets") },
-    { id: "tools", label: t("Manage external tools ..."), icon: "tool", run: () => editSettings("tools") },
+    { id: "snippets", label: t("Manage my commands ..."), icon: "snippet", keywords: "snippets", run: () => editSettings("snippets") },
     { id: "broadcast", label: t("Broadcast input to all terminals"), icon: "broadcast", keywords: "multi send all", run: () => ws.toggleBroadcast() },
-    { id: "reach", label: t("Check reachability of all connections"), icon: "activity", keywords: "ping port scan", run: () => checkReachable(state.store.sessions.map((s) => s.id)) },
     { id: "single", label: t("Layout: single pane"), icon: "single", run: () => ws.setLayout("single") },
     { id: "vertical", label: t("Layout: side by side"), icon: "splitV", keywords: "split", run: () => ws.setLayout("vertical") },
     { id: "horizontal", label: t("Layout: stacked"), icon: "splitH", keywords: "split", run: () => ws.setLayout("horizontal") },
     { id: "grid", label: t("Layout: 2 x 2 grid"), icon: "grid", keywords: "split", run: () => ws.setLayout("grid") },
-    { id: "sidebar", label: t("Show / hide connections panel"), icon: "panelLeft", shortcut: "Ctrl+Shift+B", run: () => togglePanel("sidebar") },
-    { id: "props", label: t("Show / hide properties panel"), icon: "properties", run: () => togglePanel("props") },
-    { id: "notes", label: t("Show / hide notifications"), icon: "bell", run: () => notes.toggle(() => ws.active?.fitNow()) },
+    { id: "sidebar", label: t("Show / hide connections panel"), icon: "panelLeft", shortcut: "Ctrl+Shift+B", run: toggleSidebar },
     { id: "fullscreen", label: t("Full screen"), icon: "fullscreen", shortcut: "F11", run: fullscreen },
     { id: "dark", label: t("Theme: dark"), icon: "monitor", run: () => setTheme("dark") },
     { id: "light", label: t("Theme: light"), icon: "monitor", run: () => setTheme("light") },
@@ -252,7 +220,7 @@ async function main() {
   const palette = (initialText = "") => {
     const dynamic = [
       ...actions,
-      ...state.settings.snippets.map((sn): Action => ({ id: `snippet-${sn.id}`, label: `${t("Snippet")}: ${sn.name}`, icon: "snippet", keywords: sn.command, run: () => sendSnippet(sn.command, sn.run) })),
+      ...state.settings.snippets.map((sn): Action => ({ id: `snippet-${sn.id}`, label: `${t("My commands")}: ${sn.name}`, icon: "snippet", keywords: sn.command, run: () => sendSnippet(sn.command, sn.run) })),
     ];
     openPalette(dynamic, (id) => {
       const s = state.session(id);
@@ -265,157 +233,46 @@ async function main() {
     return { label: a.label, icon: a.icon, shortcut: a.shortcut, action: a.run, ...extra };
   };
 
-  // ---------------------------------------------------------- menubar ----
-  const menus: { label: string; items: () => MenuItem[] }[] = [
+  // ----------------------------------------------------- main menu (☰) ----
+  const mainMenu = (): MenuItem[] => [
+    item("newFolder"),
+    item("keys"),
+    item("import"),
+    SEP,
     {
-      label: t("File"),
-      items: () => [
-        item("new"),
-        item("newFolder"),
-        item("local"),
-        item("sftp"),
-        SEP,
-        {
-          label: t("Import"),
-          icon: "download",
-          submenu: [
-            { label: "mRemoteNG (confCons.xml) ...", action: () => runImport("mremoteng") },
-            { label: "PuTTY", action: () => runImport("putty") },
-            { label: "OpenSSH (~/.ssh/config)", action: () => runImport("sshconfig") },
-            { label: t("SessionHub export (.json) ..."), action: () => runImport("json") },
-          ],
-        },
-        { label: t("Export ..."), icon: "upload", action: () => runImport("export") },
-        SEP,
-        { label: t("Quit"), icon: "close", shortcut: "Alt+F4", action: () => void win.close() },
-      ],
+      label: t("Layout"),
+      icon: "grid",
+      submenu: (
+        [
+          ["single", t("Single pane")],
+          ["vertical", t("Side by side")],
+          ["horizontal", t("Stacked")],
+          ["grid", t("2 x 2 grid")],
+        ] as [Layout, string][]
+      ).map(([l, label]) => item(l, { label, checked: ws.layout === l, icon: act(l).icon })),
     },
     {
-      label: t("Edit"),
-      items: () => {
-        const tab = ws.active;
-        const term = tab instanceof TerminalTab ? tab : null;
-        return [
-          { label: t("Copy"), icon: "copy", shortcut: "Ctrl+Shift+C", disabled: !term, action: () => term?.copy() },
-          { label: t("Paste"), icon: "paste", shortcut: "Ctrl+Shift+V", disabled: !term, action: () => term?.paste() },
-          { label: t("Find ..."), icon: "search", shortcut: "Ctrl+Shift+F", disabled: !term, action: () => term?.openSearch() },
-          SEP,
-          { label: t("Edit connection ..."), icon: "edit", shortcut: "F2", disabled: !selectedSession(), action: () => selectedSession() && editSession(selectedSession()!) },
-          { label: t("Delete"), icon: "trash", shortcut: "Del", disabled: !state.selection.length, action: () => tree.deleteSelection() },
-          SEP,
-          item("settings"),
-        ];
-      },
+      label: t("Theme"),
+      icon: "monitor",
+      submenu: (
+        [
+          ["dark", t("Dark")],
+          ["light", t("Light")],
+          ["system", t("System")],
+        ] as const
+      ).map(([v, l]) => ({ label: l, checked: state.settings.theme === v, action: () => setTheme(v) })),
     },
-    {
-      label: t("View"),
-      items: () => [
-        item("sidebar", { label: t("Connections"), checked: panels.sidebar, icon: undefined }),
-        item("props", { label: t("Properties"), checked: panels.props, icon: undefined }),
-        item("notes", { label: t("Notifications"), checked: notes.isOpen(), icon: undefined }),
-        SEP,
-        {
-          label: t("Layout"),
-          icon: "grid",
-          submenu: (
-            [
-              ["single", t("Single pane")],
-              ["vertical", t("Side by side")],
-              ["horizontal", t("Stacked")],
-              ["grid", t("2 x 2 grid")],
-            ] as [Layout, string][]
-          ).map(([l, label]) => item(l, { label, checked: ws.layout === l, icon: act(l).icon })),
-        },
-        {
-          label: t("Theme"),
-          icon: "monitor",
-          submenu: (
-            [
-              ["dark", t("Dark")],
-              ["light", t("Light")],
-              ["system", t("System")],
-            ] as const
-          ).map(([v, l]) => ({ label: l, checked: state.settings.theme === v, action: () => setTheme(v) })),
-        },
-        SEP,
-        { label: t("Zoom in"), shortcut: "Ctrl +", action: () => zoom(1) },
-        { label: t("Zoom out"), shortcut: "Ctrl -", action: () => zoom(-1) },
-        { label: t("Reset zoom"), shortcut: "Ctrl 0", action: () => zoom(null) },
-        SEP,
-        item("fullscreen"),
-      ],
-    },
-    {
-      label: t("Tools"),
-      items: () => [
-        { label: t("Command palette"), icon: "command", shortcut: "Ctrl+Shift+P", action: () => palette() },
-        { ...item("broadcast"), checked: ws.broadcast },
-        item("reach"),
-        SEP,
-        {
-          label: t("Snippets"),
-          icon: "snippet",
-          submenu: [
-            ...state.settings.snippets.map((sn): MenuItem => ({ label: sn.name, action: () => sendSnippet(sn.command, sn.run) })),
-            ...(state.settings.snippets.length ? [SEP] : []),
-            item("snippets", { icon: undefined }),
-          ],
-        },
-        {
-          label: t("External tools"),
-          icon: "tool",
-          submenu: [
-            ...state.settings.externalTools.map((tl): MenuItem => ({ label: tl.name, disabled: !selectedSession(), action: () => selectedSession() && runTool(selectedSession()!, tl.id) })),
-            ...(state.settings.externalTools.length ? [SEP] : []),
-            item("tools", { icon: undefined }),
-          ],
-        },
-        SEP,
-        item("settings"),
-      ],
-    },
-    {
-      label: t("Help"),
-      items: () => [
-        item("shortcuts"),
-        { label: t("About SessionHub"), icon: "info", action: () => editSettings("about") },
-      ],
-    },
+    item("sidebar", { label: t("Connections panel"), checked: showSidebar, icon: undefined }),
+    { ...item("broadcast"), checked: ws.broadcast },
+    item("fullscreen"),
+    SEP,
+    { label: t("Command palette"), icon: "command", shortcut: "Ctrl+Shift+P", action: () => palette() },
+    item("settings"),
+    item("shortcuts"),
+    { label: t("About SessionHub"), icon: "info", action: () => editSettings("about") },
+    SEP,
+    { label: t("Quit"), icon: "close", shortcut: "Alt+F4", action: () => void win.close() },
   ];
-  let openMenuIndex = -1;
-  const menuButtons: HTMLButtonElement[] = [];
-  const openTopMenu = (i: number) => {
-    const btn = menuButtons[i];
-    const r = btn.getBoundingClientRect();
-    openMenuIndex = i;
-    menuButtons.forEach((b, j) => b.classList.toggle("open", j === i));
-    contextMenu(r.left, r.bottom + 2, menus[i].items(), () => {
-      if (openMenuIndex === i) {
-        openMenuIndex = -1;
-        menuButtons.forEach((b) => b.classList.remove("open"));
-      }
-    });
-  };
-  menus.forEach((m, i) => {
-    const b = h(
-      "button",
-      {
-        class: "menu-btn",
-        onmousedown: (e: MouseEvent) => {
-          e.preventDefault();
-          e.stopPropagation();
-          if (openMenuIndex === i) closeMenu();
-          else openTopMenu(i);
-        },
-        onmouseenter: () => {
-          if (openMenuIndex >= 0 && openMenuIndex !== i) openTopMenu(i);
-        },
-      },
-      m.label,
-    ) as HTMLButtonElement;
-    menuButtons.push(b);
-  });
-  const menubar = h("nav", { class: "menubar" }, h("span", { class: "logo" }), ...menuButtons);
 
   // ---------------------------------------------------------- toolbar ----
   const quickProto = h(
@@ -438,6 +295,10 @@ async function main() {
   const refreshHistory = () => quickHistory.replaceChildren(...loadHistory().map((x) => h("option", { value: x })));
   refreshHistory();
   const doQuickConnect = () => {
+    if (hasInlinePassword(quickInput.value)) {
+      toast(t("Do not type the password here - you are asked for it when connecting."), "error");
+      return;
+    }
     const s = parseQuickConnect(quickInput.value, quickProto.value as Protocol);
     if (!s) {
       toast(t("Cannot parse '{0}'. Example: admin@10.0.0.1:2222", quickInput.value), "error");
@@ -460,61 +321,57 @@ async function main() {
 
   const toolBtn = (iconName: IconName, label: string, title: string, onclick: (e: MouseEvent) => void, cls = "") =>
     h("button", { class: `btn tool ${cls}`, title, onclick }, icon(iconName, 16), label ? h("span", { class: "tool-label" }, label) : null);
-  const layoutBtns = (["single", "vertical", "horizontal", "grid"] as Layout[]).map((l) =>
-    h("button", { class: "seg-btn", "data-layout": l, title: act(l).label, onclick: () => ws.setLayout(l) }, icon(act(l).icon!, 15)),
-  );
-  const broadcastBtn = toolBtn("broadcast", "", t("Broadcast input to all terminals"), () => ws.toggleBroadcast(), "broadcast-btn");
+  const commandsBtn = toolBtn("zap", t("Commands"), t("Ready-made and own commands for the active terminal"), (e) => {
+    const tab = activeTerminal();
+    if (!tab) {
+      toast(t("Open a connected terminal first."), "info");
+      return;
+    }
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    contextMenu(r.left, r.bottom + 4, [...tab.commandItems(), SEP, item("snippets")]);
+  });
+  const menuBtn = toolBtn("menu", "", t("Menu"), (e) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    contextMenu(r.right - 260, r.bottom + 4, mainMenu());
+  });
   const toolbar = h(
     "header",
     { class: "toolbar" },
+    h("span", { class: "logo" }),
     toolBtn("plus", t("Connection"), t("New connection ...") + " (Ctrl+Shift+N)", () => newConnection(), "accent"),
-    toolBtn("newFolder", "", t("New folder ..."), () => tree.newFolder(null)),
     toolBtn("prompt", t("Shell"), t("New local shell") + " (Ctrl+Shift+T)", () => ws.openLocal()),
     toolBtn("folderOpen", "SFTP", t("Open SFTP browser") + " (Ctrl+Shift+O)", sftpForCurrent),
     h("span", { class: "tb-sep" }),
     h("div", { class: "quick" }, quickProto, quickInput, quickHistory, h("button", { class: "btn primary quick-go", title: t("Connect"), onclick: doQuickConnect }, icon("play", 15))),
-    h("span", { class: "tb-sep" }),
-    toolBtn("snippet", "", t("Snippets"), (e) => {
-      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      contextMenu(r.left, r.bottom + 4, [
-        ...(state.settings.snippets.length
-          ? state.settings.snippets.map((sn): MenuItem => ({ label: sn.name, shortcut: sn.command.length > 28 ? `${sn.command.slice(0, 26)}...` : sn.command, action: () => sendSnippet(sn.command, sn.run) }))
-          : [{ label: t("No snippets yet"), disabled: true }]),
-        SEP,
-        item("snippets"),
-      ]);
-    }),
-    broadcastBtn,
-    h("div", { class: "seg" }, ...layoutBtns),
+    commandsBtn,
     h("div", { class: "spacer" }),
-    toolBtn("command", "", t("Command palette") + " (Ctrl+Shift+P)", () => palette()),
-    toolBtn("settings", "", t("Settings ...") + " (Ctrl+,)", () => editSettings()),
+    menuBtn,
   );
 
   // -------------------------------------------------------- statusbar ----
   const statusLeft = h("div", { class: "status-left" });
-  const notesBtn = h("button", { class: "status-btn", title: t("Notifications"), onclick: () => notes.toggle(() => ws.active?.fitNow()) });
-  const statusbar = h("footer", { class: "statusbar" }, statusLeft, h("div", { class: "spacer" }), notesBtn, h("span", { class: "muted" }, `SessionHub ${state.version}`));
+  const statusbar = h("footer", { class: "statusbar" }, statusLeft, h("div", { class: "spacer" }), h("span", { class: "muted" }, `SessionHub ${state.version}`));
 
-  document.getElementById("app")!.replaceChildren(menubar, toolbar, body, statusbar);
-  applyPanels();
+  document.getElementById("app")!.replaceChildren(toolbar, body, statusbar);
+  applySidebar();
 
-  const updateStatus = () => {
+  function updateStatus() {
     const tab = ws.active;
-    layoutBtns.forEach((b) => b.classList.toggle("on", b.dataset.layout === ws.layout));
-    broadcastBtn.classList.toggle("on", ws.broadcast);
-    const n = unreadCount();
-    notesBtn.replaceChildren(icon("bell", 13), n ? h("span", { class: "badge-count" }, String(n)) : "");
+    commandsBtn.classList.toggle("dim", !activeTerminal());
+    menuBtn.classList.toggle("on", ws.broadcast);
     if (!tab) {
       statusLeft.replaceChildren(
         h("span", { class: "muted" }, t("{0} connections", String(state.store.sessions.length))),
         ws.allTabs().length ? h("span", { class: "muted" }, `· ${t("{0} tabs open", String(ws.allTabs().length))}`) : "",
+        ws.broadcast ? h("span", { class: "status-warn" }, icon("broadcast", 13), t("Broadcast")) : "",
       );
       win.setTitle("SessionHub").catch(() => undefined);
       return;
     }
     const s = tab.session;
     const where = s.protocol === "local" ? s.shell || t("Local shell") : s.protocol === "serial" ? `${s.serialPort} @ ${s.baudRate}` : `${s.host}${s.port ? `:${s.port}` : ""}`;
+    const device = tab instanceof TerminalTab ? tab.deviceText() : "";
+    const unsaved = !s.id && s.protocol !== "local";
     statusLeft.replaceChildren(
       h("span", { class: `dot ${tab.status}` }),
       h("span", {}, tab.statusText),
@@ -522,19 +379,20 @@ async function main() {
       icon(protocolIcon(tab.kind === "sftp" ? "sftp" : s.protocol), 13),
       h("span", {}, tab.kind === "sftp" ? "SFTP" : s.protocol.toUpperCase()),
       h("span", { class: "muted" }, where),
+      device ? h("span", { class: "sep" }, "|") : "",
+      device ? h("span", { class: "muted ellipsis", title: t("Detected system") }, device) : "",
       tab.sizeText() ? h("span", { class: "sep" }, "|") : "",
       tab.sizeText() ? h("span", { class: "muted" }, tab.sizeText()) : "",
-      tab.remoteTitle ? h("span", { class: "muted ellipsis" }, `| ${tab.remoteTitle}`) : "",
+      unsaved ? h("button", { class: "status-btn", title: t("Save this quick connection permanently"), onclick: () => ws.saveTab(tab) }, icon("save", 13), t("Save connection")) : "",
       ws.broadcast ? h("span", { class: "status-warn" }, icon("broadcast", 13), t("Broadcast")) : "",
     );
     win.setTitle(`${tab.title} - SessionHub`).catch(() => undefined);
-  };
+  }
   ws.onChange = updateStatus;
   state.onStore(() => {
     ws.sessionsChanged();
     updateStatus();
   });
-  onNotify(updateStatus);
   updateStatus();
   ws.renderAll();
 
@@ -549,51 +407,28 @@ async function main() {
     }
   });
 
-  // -------------------------------------------------------- splitters ----
+  // ---------------------------------------------------------- splitter ----
   document.documentElement.style.setProperty("--sidebar-width", `${state.settings.sidebarWidth}px`);
-  document.documentElement.style.setProperty("--props-height", `${parseInt(localStorage.getItem("sessionhub.props.height") ?? "300", 10)}px`);
-  const drag = (el: HTMLElement, axis: "x" | "y", onMove: (delta: number, start: number) => void, onEnd: () => void, start: () => number) => {
-    el.addEventListener("mousedown", (e) => {
-      e.preventDefault();
-      const origin = axis === "x" ? e.clientX : e.clientY;
-      const initialValue = start();
-      const move = (ev: MouseEvent) => onMove((axis === "x" ? ev.clientX : ev.clientY) - origin, initialValue);
-      const up = () => {
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
-        document.body.classList.remove("resizing", `resizing-${axis}`);
-        onEnd();
-        ws.allTabs().forEach((x) => x.fitNow());
-      };
-      document.body.classList.add("resizing", `resizing-${axis}`);
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
-    });
-  };
   let sidebarWidth = state.settings.sidebarWidth;
-  drag(
-    resizer,
-    "x",
-    (d, s0) => {
-      sidebarWidth = Math.max(200, Math.min(700, s0 + d));
+  resizer.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const origin = e.clientX;
+    const start = sidebar.getBoundingClientRect().width;
+    const move = (ev: MouseEvent) => {
+      sidebarWidth = Math.max(200, Math.min(700, start + ev.clientX - origin));
       document.documentElement.style.setProperty("--sidebar-width", `${sidebarWidth}px`);
-    },
-    () => {
+    };
+    const up = () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+      document.body.classList.remove("resizing", "resizing-x");
       if (sidebarWidth !== state.settings.sidebarWidth) state.saveSettings({ ...state.settings, sidebarWidth }).catch(() => undefined);
-    },
-    () => sidebar.getBoundingClientRect().width,
-  );
-  let propsHeight = 300;
-  drag(
-    sideSplit,
-    "y",
-    (d, s0) => {
-      propsHeight = Math.max(120, Math.min(sidebar.getBoundingClientRect().height - 160, s0 - d));
-      document.documentElement.style.setProperty("--props-height", `${propsHeight}px`);
-    },
-    () => store("sessionhub.props.height", String(Math.round(propsHeight))),
-    () => grid.el.getBoundingClientRect().height,
-  );
+      ws.allTabs().forEach((x) => x.fitNow());
+    };
+    document.body.classList.add("resizing", "resizing-x");
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  });
 
   // -------------------------------------------------------- shortcuts ----
   document.addEventListener(
@@ -607,8 +442,8 @@ async function main() {
       else if (cs && e.code === "KeyN") newConnection();
       else if (cs && e.code === "KeyW") ws.active && ws.closeTab(ws.active);
       else if (cs && e.code === "KeyK") quickInput.focus();
-      else if (cs && e.code === "KeyE") (panels.sidebar || togglePanel("sidebar"), tree.focusFilter());
-      else if (cs && e.code === "KeyB") togglePanel("sidebar");
+      else if (cs && e.code === "KeyE") (showSidebar || toggleSidebar(), tree.focusFilter());
+      else if (cs && e.code === "KeyB") toggleSidebar();
       else if (cs && e.code === "KeyD") ws.active && ws.duplicateTab(ws.active);
       else if (cs && e.code === "KeyO") sftpForCurrent();
       else if (e.ctrlKey && !e.shiftKey && e.key === ",") editSettings();
@@ -655,8 +490,6 @@ async function main() {
     console.error(e.reason);
     notify("error", errorText(e.reason), "", { toast: true });
   });
-
-  notify("info", t("SessionHub {0} started - {1} connections loaded", state.version, String(state.store.sessions.length)));
 }
 
 main();

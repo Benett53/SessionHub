@@ -564,7 +564,7 @@ export class SftpTab implements Tab {
     };
     try {
       await run(id, ch);
-      notify("success", dir === "up" ? t("Uploaded {0}", name) : t("Downloaded {0}", name), this.title);
+      notify("success", dir === "up" ? t("Uploaded {0}", name) : t("Downloaded {0}", name), this.title, { toast: true });
     } catch (e) {
       notify("error", `${name}: ${errorText(e)}`, this.title, { toast: !/cancelled/.test(errorText(e)) });
     } finally {

@@ -9,22 +9,37 @@ import {
   newSession,
   sessionTitle,
   uid,
-  type ExternalTool,
+  type Folder,
   type Forward,
   type ImportReport,
+  type KeyInfo,
   type Protocol,
   type Session,
   type Settings,
   type Snippet,
 } from "./api";
+import { FAMILIES } from "./commands";
 import { t } from "./i18n";
 import { icon, protocolIcon, type IconName } from "./icons";
+import { keyManager } from "./keys";
 import { notify } from "./notifications";
-import { BAUD_RATES, COLORS } from "./propgrid";
 import { state } from "./state";
 import { DEFAULT_FONT } from "./terminal";
 import { SCHEMES } from "./themes";
 import { alertDialog, checkbox, field, h, modal, select, toast } from "./ui";
+
+export const PROTOCOL_LABELS: [Protocol, string][] = [
+  ["ssh", "SSH"],
+  ["telnet", "Telnet"],
+  ["raw", "Raw TCP"],
+  ["serial", "Serial"],
+  ["local", "Local shell"],
+  ["rdp", "RDP"],
+  ["vnc", "VNC"],
+];
+
+export const COLORS = ["", "#f85149", "#f0883e", "#d29922", "#3fb950", "#39c5cf", "#58a6ff", "#bc8cff", "#ff7eb6"];
+const BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
 
 const PROTOCOLS: [Protocol, string, string][] = [
   ["ssh", "SSH", "Secure Shell"],
@@ -43,6 +58,31 @@ function num(input: HTMLInputElement, fallback = 0) {
 
 function section(title: string, ...children: (Node | null)[]) {
   return h("fieldset", { class: "section" }, h("legend", {}, title), ...children);
+}
+
+/** Collapsible block for rarely needed options (closed by default). */
+function advanced(title: string, ...children: (Node | null)[]) {
+  return h("details", { class: "advanced" }, h("summary", {}, title), h("div", { class: "advanced-body" }, ...children));
+}
+
+/** Key file input with suggestions from ~/.ssh and a button for the key manager. */
+function keyFileInput(value: string, placeholder = "~/.ssh/id_ed25519") {
+  const input = h("input", { type: "text", value, placeholder, spellcheck: false, list: "known-keys" }) as HTMLInputElement;
+  const list = h("datalist", { id: "known-keys" });
+  const refresh = async () => {
+    const keys: KeyInfo[] = await api.listKeys().catch(() => []);
+    list.replaceChildren(...keys.map((k) => h("option", { value: k.path }, `${k.name}  ${k.algorithm}`)));
+  };
+  void refresh();
+  const row = h(
+    "div",
+    { class: "row" },
+    field(t("Private key"), input),
+    h("button", { type: "button", class: "btn", title: t("Choose a file"), onclick: () => browse(input, t("Select private key")) }, icon("folderOpen", 14)),
+    h("button", { type: "button", class: "btn", title: t("SSH keys"), onclick: async () => (await keyManager(), await refresh()) }, icon("key", 14), t("Keys ...")),
+    list,
+  );
+  return { row, input };
 }
 
 async function browse(input: HTMLInputElement, title: string, directory = false) {
@@ -74,8 +114,16 @@ export function setConnectHook(fn: (s: Session, password: string | null) => void
   connectHook = fn;
 }
 
-/** Create or edit a connection. Returns the saved session, or null if cancelled. */
-export async function editSession(initial: Session | null, folder: string | null = null, preset: Partial<Session> = {}): Promise<Session | null> {
+/**
+ * Create or edit a connection. Returns the saved session, or null if cancelled.
+ * `saveOnly`: no "Save & connect" (used to keep a quick connection that is already open).
+ */
+export async function editSession(
+  initial: Session | null,
+  folder: string | null = null,
+  preset: Partial<Session> = {},
+  opts: { saveOnly?: boolean } = {},
+): Promise<Session | null> {
   const s: Session = structuredClone(initial ?? newSession({ folder, ...preset }));
   const isNew = !s.id;
   const hasStoredPw = !isNew && s.savePassword ? await api.hasPassword(s.id).catch(() => false) : false;
@@ -123,7 +171,8 @@ export async function editSession(initial: Session | null, folder: string | null
   const favorite = checkbox(t("Add to favorites"), s.favorite);
 
   // --- ssh ---
-  const keyFile = h("input", { type: "text", value: s.keyFile, placeholder: "~/.ssh/id_ed25519", spellcheck: false }) as HTMLInputElement;
+  const inhKey = state.inherited(s.folder, "keyFile");
+  const { row: keyRow, input: keyFile } = keyFileInput(s.keyFile, inhKey ? t("inherited: {0} (from {1})", inhKey.value, inhKey.from.name) : t("(automatic: SSH agent and ~/.ssh/id_*)"));
   const useAgent = checkbox(t("Use SSH agent"), s.useAgent);
   const compression = checkbox(t("Compression"), s.compression);
   const jumpCandidates = state.store.sessions
@@ -195,14 +244,18 @@ export async function editSession(initial: Session | null, folder: string | null
   let color = s.color;
   const scheme = select([["", t("(global setting)")], ...SCHEMES.map((x): [string, string] => [x.id, x.name])], s.colorScheme);
   const notes = h("textarea", { rows: 2, value: s.notes }) as HTMLTextAreaElement;
+  const deviceType = select([["", t("Automatic (SSH)")], ...FAMILIES.map(([f, l]): [string, string] => [f, l])], s.deviceType);
 
   const sshSection = section(
     "SSH",
-    h("div", { class: "row" }, field(t("Private key"), keyFile), h("button", { type: "button", class: "btn", onclick: () => browse(keyFile, t("Select private key")) }, icon("folderOpen", 14), t("Browse ..."))),
-    h("div", { class: "row checks" }, useAgent.el, compression.el),
-    h("div", { class: "row" }, field(t("Jump host (ProxyJump)"), jump), field(t("Keepalive (s)"), keepalive)),
-    field(t("Remote command"), remoteCmd),
-    h("div", { class: "field" }, h("span", {}, t("Local port forwarding")), fwdList),
+    keyRow,
+    advanced(
+      t("Advanced SSH options"),
+      h("div", { class: "row checks" }, useAgent.el, compression.el),
+      h("div", { class: "row" }, field(t("Jump host (ProxyJump)"), jump), field(t("Keepalive (s)"), keepalive)),
+      field(t("Remote command"), remoteCmd),
+      h("div", { class: "field" }, h("span", {}, t("Local port forwarding")), fwdList),
+    ),
   );
   const serialSection = section(
     t("Serial"),
@@ -225,9 +278,10 @@ export async function editSession(initial: Session | null, folder: string | null
     userRow,
     h("div", { class: "row checks" }, savePw.el, favorite.el),
   );
-  const advanced = section(
-    t("Appearance & more"),
+  const more = advanced(
+    t("Appearance, commands and notes"),
     h("div", { class: "row" }, h("div", { class: "field" }, h("span", {}, t("Color")), swatches(color, (c) => (color = c))), field(t("Color scheme"), scheme)),
+    field(t("Device type for ready-made commands"), deviceType, t("Detected automatically for SSH. Choose it for Telnet and serial consoles.")),
     logOutput.el,
     field(t("Notes"), notes),
   );
@@ -247,6 +301,7 @@ export async function editSession(initial: Session | null, folder: string | null
     externalSection.classList.toggle("hidden", !isExternal(p));
     logOutput.el.classList.toggle("hidden", isExternal(p));
     scheme.parentElement!.classList.toggle("hidden", isExternal(p));
+    deviceType.parentElement!.classList.toggle("hidden", p === "local" || isExternal(p));
     if (p === "serial" && !portList.childElementCount) refreshPorts();
   };
   update();
@@ -284,6 +339,7 @@ export async function editSession(initial: Session | null, folder: string | null
       logOutput: logOutput.input.checked,
       color,
       colorScheme: scheme.value,
+      deviceType: deviceType.value,
       notes: notes.value,
     };
   };
@@ -299,14 +355,19 @@ export async function editSession(initial: Session | null, folder: string | null
   // Saving happens inside validate(): on error the dialog stays open and nothing typed is lost.
   let saved: Session | null = null;
   const result = await modal<"cancel" | "save" | "connect">({
-    title: isNew ? t("New connection") : t("Edit connection - {0}", sessionTitle(s)),
+    title: opts.saveOnly ? t("Save connection") : isNew ? t("New connection") : t("Edit connection - {0}", sessionTitle(s)),
     wide: true,
-    body: [cards, general, sshSection, serialSection, localSection, telnetSection, externalSection, advanced],
-    buttons: [
-      { label: t("Cancel"), value: "cancel" },
-      { label: t("Save"), value: "save" },
-      { label: t("Save & connect"), value: "connect", primary: true },
-    ],
+    body: [cards, general, sshSection, serialSection, localSection, telnetSection, externalSection, more],
+    buttons: opts.saveOnly
+      ? [
+          { label: t("Cancel"), value: "cancel" },
+          { label: t("Save"), value: "save", primary: true },
+        ]
+      : [
+          { label: t("Cancel"), value: "cancel" },
+          { label: t("Save"), value: "save" },
+          { label: t("Save & connect"), value: "connect", primary: true },
+        ],
     cancelValue: "cancel",
     validate: async () => {
       const session = collect();
@@ -330,6 +391,77 @@ export async function editSession(initial: Session | null, folder: string | null
   state.select([`s:${(saved as Session).id}`]);
   if (result === "connect") connectHook?.(saved, password.value || null);
   return saved;
+}
+
+/**
+ * Edit a folder. Connections inside inherit username, key, jump host,
+ * password and color when their own field is empty.
+ */
+export async function editFolder(f: Folder): Promise<void> {
+  const hasStoredPw = f.savePassword ? await api.hasPassword(f.id).catch(() => false) : false;
+  const name = h("input", { type: "text", value: f.name, spellcheck: false }) as HTMLInputElement;
+  const parent = select([["", t("(root)")], ...state.folderOptions(f.id)], f.parent ?? "");
+  const user = h("input", { type: "text", value: f.username, spellcheck: false, autocapitalize: "off" }) as HTMLInputElement;
+  const password = h("input", { type: "password", autocomplete: "new-password", placeholder: hasStoredPw ? t("(saved - leave empty to keep)") : "" }) as HTMLInputElement;
+  const savePw = checkbox(t("Save password in the system keyring"), f.savePassword);
+  const { row: keyRow, input: keyFile } = keyFileInput(f.keyFile, "");
+  const jumpCandidates = state.store.sessions
+    .filter((x) => x.protocol === "ssh")
+    .map((x): [string, string] => [x.id, sessionTitle(x)])
+    .sort((a, b) => a[1].localeCompare(b[1]));
+  const jump = select([["", t("(none - direct connection)")], ...jumpCandidates], f.jumpHost ?? "");
+  let color = f.color;
+  const notes = h("textarea", { rows: 2, value: f.notes }) as HTMLTextAreaElement;
+  const ok = await modal<boolean>({
+    title: t("Edit folder - {0}", f.name),
+    wide: true,
+    body: [
+      section(t("Folder"), h("div", { class: "row" }, field(t("Name"), name), field(t("Parent folder"), parent))),
+      section(
+        t("Defaults for connections in this folder"),
+        h("p", { class: "muted small" }, t("Used by every connection inside (also in sub folders) whose own field is empty.")),
+        h("div", { class: "row" }, field(t("Username"), user), field(t("Password"), password)),
+        savePw.el,
+        keyRow,
+        field(t("Jump host (ProxyJump)"), jump),
+        h("div", { class: "field" }, h("span", {}, t("Color")), swatches(color, (c) => (color = c))),
+      ),
+      advanced(t("Notes"), notes),
+    ],
+    buttons: [
+      { label: t("Cancel"), value: false },
+      { label: t("Save"), value: true, primary: true },
+    ],
+    cancelValue: false,
+    validate: async () => {
+      if (!name.value.trim()) {
+        toast(t("Please enter a name."), "error");
+        return false;
+      }
+      try {
+        await api.saveFolder(
+          {
+            ...f,
+            name: name.value.trim(),
+            parent: parent.value || null,
+            username: user.value.trim(),
+            keyFile: keyFile.value.trim(),
+            jumpHost: jump.value || null,
+            savePassword: savePw.input.checked,
+            color,
+            notes: notes.value,
+          },
+          password.value || null,
+        );
+        return true;
+      } catch (e) {
+        await alertDialog(t("Could not save folder"), errorText(e));
+        return false;
+      }
+    },
+  });
+  password.value = "";
+  if (ok) await state.reloadStore();
 }
 
 // ------------------------------------------------------------ settings ----
@@ -416,8 +548,8 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
   const logDir = h("input", { type: "text", value: cur.logDir, placeholder: state.paths.logDir, spellcheck: false }) as HTMLInputElement;
   const rdp = h("input", { type: "text", value: cur.rdpCommand, spellcheck: false, placeholder: state.isWindows() ? "mstsc.exe /v:{host}:{port}" : t("(automatic: FreeRDP or Remmina)") }) as HTMLInputElement;
   const vnc = h("input", { type: "text", value: cur.vncCommand, spellcheck: false, placeholder: t("(automatic: TigerVNC or Remmina)") }) as HTMLInputElement;
+  const detect = checkbox(t("Detect the system after an SSH login and offer matching commands"), cur.detectDevice);
   const snippets: Snippet[] = structuredClone(cur.snippets);
-  const tools: ExternalTool[] = structuredClone(cur.externalTools);
 
   const body = pages(
     [
@@ -469,6 +601,7 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
             field(t("Default local shell"), defShell),
             h("div", { class: "row" }, field(t("SSH keepalive (s, 0 = off)"), keepalive), field(t("Connect timeout (s)"), timeout)),
             autoReconnect.el,
+            detect.el,
             field(t("Session log directory"), logDir),
           ),
           section(t("External viewers"), field(t("RDP command"), rdp, t("Placeholders: {host} {port} {user} {args}")), field(t("VNC command"), vnc)),
@@ -476,12 +609,12 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
       },
       {
         id: "snippets",
-        label: t("Snippets"),
+        label: t("My commands"),
         icon: "snippet",
         body: h(
           "div",
           {},
-          h("p", { class: "muted" }, t("Frequently used commands. Send them via the toolbar, the terminal context menu or the command palette.")),
+          h("p", { class: "muted" }, t("Your own frequently used commands. They appear in the Commands menu next to the ready-made ones and in the command palette.")),
           listEditor(
             snippets,
             [
@@ -490,27 +623,7 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
               { label: t("Run"), kind: "check", get: (x) => x.run, set: (x, v) => (x.run = v === true) },
             ],
             () => ({ id: uid(), name: "", command: "", run: true }),
-            t("Add snippet"),
-          ),
-        ),
-      },
-      {
-        id: "tools",
-        label: t("External tools"),
-        icon: "tool",
-        body: h(
-          "div",
-          {},
-          h("p", { class: "muted" }, t("Programs started for a connection (right click a connection). Placeholders: {host} {port} {user} {name} {protocol}. Commands starting with http:// or https:// open in the browser.")),
-          listEditor(
-            tools,
-            [
-              { label: t("Name"), get: (x) => x.name, set: (x, v) => (x.name = String(v)), placeholder: "Ping" },
-              { label: t("Command"), get: (x) => x.command, set: (x, v) => (x.command = String(v)), placeholder: "ping {host}", mono: true },
-              { label: t("In terminal"), kind: "check", get: (x) => x.inTerminal, set: (x, v) => (x.inTerminal = v === true) },
-            ],
-            () => ({ id: uid(), name: "", command: "", inTerminal: true }),
-            t("Add tool"),
+            t("Add command"),
           ),
         ),
       },
@@ -567,8 +680,8 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
     logDir: logDir.value.trim(),
     rdpCommand: rdp.value.trim(),
     vncCommand: vnc.value.trim(),
+    detectDevice: detect.input.checked,
     snippets: snippets.filter((x) => x.command.trim()).map((x) => ({ ...x, name: x.name.trim() || x.command.trim().slice(0, 40) })),
-    externalTools: tools.filter((x) => x.command.trim()).map((x) => ({ ...x, name: x.name.trim() || x.command.trim().split(/\s+/)[0] })),
   };
   const languageChanged = next.language !== cur.language;
   try {

@@ -13,8 +13,7 @@ export interface TreeActions {
   edit(s: Session): void;
   newSession(folder: string | null): void;
   duplicate(s: Session): void;
-  runTool(s: Session, toolId: string): void;
-  checkReachable(ids: string[]): void;
+  editFolder(f: Folder): void;
 }
 
 type Row =
@@ -82,7 +81,6 @@ export class SessionTree {
       h("div", { class: "spacer" }),
       tool("plus", t("New connection") + " (Ctrl+Shift+N)", () => this.actions.newSession(this.targetFolder())),
       tool("newFolder", t("New folder"), () => this.newFolder(this.targetFolder())),
-      tool("activity", t("Check reachability"), () => this.actions.checkReachable(state.store.sessions.map((s) => s.id))),
       tool("more", t("More"), () => {
         const r = header.getBoundingClientRect();
         contextMenu(r.right - 220, r.bottom, [
@@ -134,7 +132,6 @@ export class SessionTree {
     root.append(header, search, this.list);
     state.onStore(() => this.render());
     state.on("selection", () => this.renderSelection());
-    state.on("reachability", () => this.render());
     this.render();
   }
 
@@ -315,7 +312,6 @@ export class SessionTree {
     }
 
     const s = row.session;
-    const reach = state.reachability.get(s.id);
     const detail =
       s.protocol === "local"
         ? s.shell || ""
@@ -328,7 +324,7 @@ export class SessionTree {
       {
         ...common,
         class: "tree-row session",
-        title: [sessionTitle(s), `${PROTO_LABEL[s.protocol]}  ${detail}`, reach ? (reach.reachable ? t("reachable ({0} ms)", String(reach.millis)) : t("not reachable")) : "", s.notes]
+        title: [sessionTitle(s), `${PROTO_LABEL[s.protocol]}  ${detail}`, s.notes]
           .filter(Boolean)
           .join("\n"),
         ondblclick: () => this.actions.connect(s),
@@ -342,7 +338,6 @@ export class SessionTree {
       h("span", { class: `proto-icon p-${s.protocol}`, style: color ? `color:${color}` : "" }, icon(protocolIcon(s.protocol), 16)),
       h("span", { class: "name" }, sessionTitle(s)),
       s.favorite && !key.endsWith("|fav") ? h("span", { class: "fav" }, icon("star", 12)) : null,
-      reach ? h("span", { class: `reach ${reach.reachable ? "up" : "down"}` }) : null,
       h("span", { class: "detail" }, detail),
     );
   }
@@ -414,7 +409,7 @@ export class SessionTree {
         break;
       case "F2":
         if (session) this.actions.edit(session);
-        else if (folder) this.renameFolder(folder);
+        else if (folder) this.actions.editFolder(folder);
         break;
       case "Delete":
         this.deleteSelection();
@@ -454,13 +449,6 @@ export class SessionTree {
 
   // ------------------------------------------------------------- menus ----
 
-  private toolsMenu(s: Session): MenuItem[] {
-    const tools = state.settings.externalTools;
-    return tools.length
-      ? tools.map((tl) => ({ label: tl.name, icon: tl.inTerminal ? "prompt" : "tool", action: () => this.actions.runTool(s, tl.id) }))
-      : [{ label: t("No tools defined (Settings)"), disabled: true }];
-  }
-
   private moveMenu(): MenuItem[] {
     return [
       { label: t("(root)"), action: () => this.moveSelection(null) },
@@ -488,7 +476,6 @@ export class SessionTree {
     if (multi.length > 1) {
       contextMenu(x, y, [
         { label: t("Connect {0} sessions", String(multi.length)), icon: "play", action: () => multi.forEach((m) => this.actions.connect(m)) },
-        { label: t("Check reachability"), icon: "activity", action: () => this.actions.checkReachable(multi.map((m) => m.id)) },
         { label: t("Move to"), icon: "folder", submenu: this.moveMenu() },
         SEP,
         { label: t("Delete {0} sessions", String(multi.length)), icon: "trash", danger: true, action: () => this.deleteSelection() },
@@ -498,7 +485,6 @@ export class SessionTree {
     contextMenu(x, y, [
       { label: t("Connect"), icon: "play", shortcut: "Enter", action: () => this.actions.connect(s) },
       ...(s.protocol === "ssh" ? [{ label: t("Open SFTP browser"), icon: "folderOpen" as const, action: () => this.actions.openSftp(s) }] : []),
-      { label: t("External tools"), icon: "tool", submenu: this.toolsMenu(s) },
       SEP,
       { label: t("Edit ..."), icon: "edit", shortcut: "F2", action: () => this.actions.edit(s) },
       { label: t("Duplicate"), icon: "copy", action: () => this.actions.duplicate(s) },
@@ -507,7 +493,6 @@ export class SessionTree {
         icon: "star",
         action: () => this.setFavorite(s, !s.favorite),
       },
-      { label: t("Check reachability"), icon: "activity", action: () => this.actions.checkReachable([s.id]) },
       { label: t("Move to"), icon: "folder", submenu: this.moveMenu() },
       SEP,
       { label: t("Delete"), icon: "trash", shortcut: "Del", danger: true, action: () => this.deleteSelection() },
@@ -516,14 +501,12 @@ export class SessionTree {
 
   private folderMenu(f: Folder, x: number, y: number) {
     const sessions = state.store.sessions.filter((s) => s.folder === f.id);
-    const below = state.sessionsBelow(f.id);
     contextMenu(x, y, [
       { label: t("Connect all ({0})", String(sessions.length)), icon: "play", disabled: !sessions.length, action: () => sessions.forEach((s) => this.actions.connect(s)) },
-      { label: t("Check reachability"), icon: "activity", disabled: !below.length, action: () => this.actions.checkReachable(below.map((s) => s.id)) },
       SEP,
       { label: t("New connection ..."), icon: "plus", action: () => this.actions.newSession(f.id) },
       { label: t("New subfolder ..."), icon: "newFolder", action: () => this.newFolder(f.id) },
-      { label: t("Rename ..."), icon: "edit", shortcut: "F2", action: () => this.renameFolder(f) },
+      { label: t("Edit folder ..."), icon: "edit", shortcut: "F2", action: () => this.actions.editFolder(f) },
       { label: t("Move to"), icon: "folder", submenu: [{ label: t("(root)"), action: () => this.moveSelection(null) }, ...state.folderOptions(f.id).map(([id, path]): MenuItem => ({ label: path, icon: "folder", action: () => this.moveSelection(id) }))] },
       SEP,
       { label: t("Delete folder"), icon: "trash", shortcut: "Del", danger: true, action: () => this.deleteFolder(f) },
@@ -548,17 +531,6 @@ export class SessionTree {
       if (p && !p.expanded) await api.saveFolder({ ...p, expanded: true });
       await state.reloadStore();
       state.select([`f:${f.id}`]);
-    } catch (e) {
-      notify("error", errorText(e), "", { toast: true });
-    }
-  }
-
-  private async renameFolder(f: Folder) {
-    const name = await promptDialog(t("Rename folder"), t("Name"), f.name);
-    if (!name?.trim()) return;
-    try {
-      await api.saveFolder({ ...f, name: name.trim() });
-      await state.reloadStore();
     } catch (e) {
       notify("error", errorText(e), "", { toast: true });
     }

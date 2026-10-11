@@ -4903,7 +4903,7 @@ dependencies = [
 
 [[package]]
 name = "sessionhub"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "data-encoding",
@@ -4916,6 +4916,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "quick-xml 0.38.4",
+ "rand 0.10.3",
  "russh",
  "russh-sftp",
  "serde",
@@ -4932,6 +4933,7 @@ dependencies = [
  "tokio",
  "uuid",
  "winreg 0.55.0",
+ "zeroize",
 ]
 
 [[package]]

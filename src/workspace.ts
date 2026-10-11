@@ -42,6 +42,8 @@ export class Workspace implements TabHost {
   broadcast = false;
   private drag: { tab: Tab; from: Group } | null = null;
   onChange: () => void = () => undefined;
+  /** Opens the "save connection" dialog for an unsaved tab (set by main.ts). */
+  onSaveTab: (tab: Tab) => void = () => undefined;
 
   constructor(
     private readonly root: HTMLElement,
@@ -191,6 +193,10 @@ export class Workspace implements TabHost {
 
   openLocal() {
     this.open(newSession({ protocol: "local", name: t("Local shell") }));
+  }
+
+  saveTab(tab: Tab) {
+    this.onSaveTab(tab);
   }
 
   activate(tab: Tab | null) {

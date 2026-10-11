@@ -9,7 +9,7 @@ export interface StartActions {
   newSession(): void;
   localShell(): void;
   importSessions(): void;
-  palette(): void;
+  keys(): void;
   connect(s: Session): void;
   shortcuts(): void;
 }
@@ -72,7 +72,7 @@ export class StartPage {
           { class: "start-cards" },
           this.card("plus", t("New connection"), t("SSH, Telnet, Serial, RDP, VNC ..."), () => this.actions.newSession(), "Ctrl+Shift+N"),
           this.card("prompt", t("Local shell"), t("Terminal on this computer"), () => this.actions.localShell(), "Ctrl+Shift+T"),
-          this.card("command", t("Command palette"), t("Find connections and commands"), () => this.actions.palette(), "Ctrl+Shift+P"),
+          this.card("key", t("SSH keys"), t("Create keys, copy public keys"), () => this.actions.keys()),
           this.card("download", t("Import"), t("mRemoteNG, PuTTY, OpenSSH config"), () => this.actions.importSessions()),
         ),
         lists.length ? h("div", { class: "start-lists" }, ...(lists as HTMLElement[])) : null,

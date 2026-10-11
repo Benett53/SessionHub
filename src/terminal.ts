@@ -9,8 +9,10 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 
-import { api, errorText, sessionTitle, type ConnEvent, type PromptReply, type Session } from "./api";
+import { api, errorText, sessionTitle, type ConnEvent, type DeviceInfo, type PromptReply, type Session } from "./api";
+import { commandGroups, deviceOf, FAMILIES, type Family } from "./commands";
 import { t, tb } from "./i18n";
+import { pickKey } from "./keys";
 import { notify } from "./notifications";
 import { authPrompt, hostKeyPrompt } from "./prompts";
 import { state } from "./state";
@@ -62,6 +64,9 @@ export class TerminalTab implements Tab {
   private reconnectTimer = 0;
   private wasConnected = false;
   private disposed = false;
+  /** Result of the automatic device detection (SSH only). */
+  detected: DeviceInfo | null = null;
+  detecting = false;
 
   constructor(
     private readonly host: TabHost,
@@ -247,6 +252,7 @@ export class TerminalTab implements Tab {
         this.setStatus("connected", t("Connected"));
         this.fitNow(true);
         if (this.host.isActive(this)) this.focus();
+        if (this.session.protocol === "ssh" && state.settings.detectDevice && !this.session.deviceType) void this.detect();
         break;
       case "hostKey": {
         const reply = await hostKeyPrompt(ev, this.title);
@@ -259,7 +265,7 @@ export class TerminalTab implements Tab {
         break;
       }
       case "passwordSaved": {
-        notify("info", t("Password saved in the system keyring"), this.title);
+        notify("success", t("Password saved in the system keyring"), this.title, { toast: true });
         const stored = state.session(this.session.id);
         if (stored && !stored.savePassword) {
           try {
@@ -274,6 +280,117 @@ export class TerminalTab implements Tab {
       case "closed":
         this.closed(tb(ev.reason), ev.error);
         break;
+    }
+  }
+
+  /** Identify the remote system on a separate channel (the shell is not touched). */
+  private async detect() {
+    const id = this.connId;
+    if (!id) return;
+    this.detecting = true;
+    try {
+      const info = await api.detectDevice(id);
+      if (id === this.connId) this.detected = info.family === "unknown" ? null : info;
+    } catch {
+      // detection is best effort
+    } finally {
+      this.detecting = false;
+      this.host.onTabChanged(this);
+    }
+  }
+
+  /** Device used for ready-made commands: manual choice first, then detection. */
+  device(): DeviceInfo | null {
+    const manual = this.session.deviceType as Family;
+    if (manual && FAMILIES.some(([f]) => f === manual)) return deviceOf(manual);
+    return this.detected;
+  }
+
+  /** Short description for the status bar, e.g. "Ubuntu 24.04 LTS (x86_64)". */
+  deviceText(): string {
+    const d = this.device();
+    if (!d) return this.detecting ? t("Detecting system ...") : "";
+    return [d.name, d.arch ? `(${d.arch})` : ""].filter(Boolean).join(" ");
+  }
+
+  private async setDeviceType(family: string) {
+    this.session.deviceType = family;
+    const stored = state.session(this.session.id);
+    if (stored) {
+      try {
+        await api.saveSession({ ...stored, deviceType: family }, null);
+        await state.reloadStore();
+      } catch (e) {
+        toast(errorText(e), "error");
+      }
+    }
+    this.host.onTabChanged(this);
+  }
+
+  /** "Commands" menu: ready-made commands for the device plus the user's own snippets. */
+  commandItems(): MenuItem[] {
+    const d = this.device();
+    const items: MenuItem[] = [];
+    const preview = (c: string) => (c.length > 34 ? `${c.slice(0, 32)}...` : c);
+    if (d) {
+      items.push({ label: this.deviceText(), icon: "info", disabled: true });
+      for (const g of commandGroups(d)) {
+        items.push({
+          label: g.label,
+          submenu: g.items.map((c) => ({
+            label: c.label,
+            icon: c.run ? "play" : "edit",
+            shortcut: preview(c.command),
+            action: () => this.sendSnippet(c.command, c.run),
+          })),
+        });
+      }
+    } else {
+      items.push({ label: this.detecting ? t("Detecting system ...") : t("System not detected - choose the device type below"), icon: "info", disabled: true });
+    }
+    const snippets = state.settings.snippets;
+    items.push(SEP, {
+      label: t("My commands"),
+      icon: "snippet",
+      submenu: snippets.length
+        ? snippets.map((sn) => ({ label: sn.name, shortcut: preview(sn.command), action: () => this.sendSnippet(sn.command, sn.run) }))
+        : [{ label: t("No own commands yet (Settings > My commands)"), disabled: true }],
+    });
+    items.push({
+      label: t("Device type"),
+      icon: "server",
+      submenu: [
+        { label: this.detected ? t("Automatic ({0})", this.detected.name) : t("Automatic"), checked: !this.session.deviceType, action: () => void this.setDeviceType("") },
+        SEP,
+        ...FAMILIES.map(([f, label]): MenuItem => ({ label, checked: this.session.deviceType === f, action: () => void this.setDeviceType(f) })),
+      ],
+    });
+    return items;
+  }
+
+  /** Append a public key to ~/.ssh/authorized_keys on this server (like ssh-copy-id). */
+  async installKey() {
+    if (!this.connId || this.session.protocol !== "ssh") return;
+    const key = await pickKey(t("Install public key on {0}", this.title));
+    if (!key || !this.connId) return;
+    try {
+      await api.installPublicKey(this.connId, key.path);
+    } catch (e) {
+      toast(tb(errorText(e)), "error");
+      return;
+    }
+    toast(t("Public key '{0}' installed on the server.", key.name), "success");
+    const stored = state.session(this.session.id);
+    if (stored && stored.keyFile !== key.path) {
+      const use = await confirmDialog(t("Use key for this connection?"), t("Log in with '{0}' from now on instead of a password?", key.name), t("Use key"));
+      if (use) {
+        try {
+          await api.saveSession({ ...stored, keyFile: key.path }, null);
+          await state.reloadStore();
+        } catch (e) {
+          toast(errorText(e), "error");
+        }
+      }
     }
   }
 
@@ -410,25 +527,25 @@ export class TerminalTab implements Tab {
   }
 
   menuItems(): MenuItem[] {
-    return this.session.protocol === "ssh"
-      ? [{ label: t("Open SFTP browser"), icon: "folderOpen", action: () => this.host.openSftp(this.session) }]
-      : [];
+    const items: MenuItem[] = [];
+    if (!this.session.id && this.session.protocol !== "local") {
+      items.push({ label: t("Save as connection ..."), icon: "save", action: () => this.host.saveTab(this) });
+    }
+    if (this.session.protocol === "ssh") {
+      items.push({ label: t("Open SFTP browser"), icon: "folderOpen", action: () => this.host.openSftp(this.session) });
+      items.push({ label: t("Install public key ..."), icon: "key", disabled: !this.connected, action: () => void this.installKey() });
+    }
+    return items;
   }
 
   private showMenu(x: number, y: number) {
     const hasSel = this.term.hasSelection();
-    const snippets = state.settings.snippets;
     contextMenu(x, y, [
       { label: t("Copy"), icon: "copy", shortcut: "Ctrl+Shift+C", disabled: !hasSel, action: () => this.copy() },
       { label: t("Paste"), icon: "paste", shortcut: "Ctrl+Shift+V", action: () => this.paste() },
       { label: t("Select all"), action: () => this.term.selectAll() },
       SEP,
-      {
-        label: t("Snippets"),
-        icon: "snippet",
-        disabled: !snippets.length,
-        submenu: snippets.map((sn) => ({ label: sn.name, action: () => this.sendSnippet(sn.command, sn.run) })),
-      },
+      { label: t("Commands"), icon: "zap", disabled: !this.connected, submenu: this.commandItems() },
       { label: t("Find ..."), icon: "search", shortcut: "Ctrl+Shift+F", action: () => this.openSearch() },
       { label: t("Clear scrollback"), action: () => this.term.clear() },
       { label: t("Reset terminal"), action: () => this.term.reset() },

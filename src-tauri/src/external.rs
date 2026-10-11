@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 
 use crate::model::{Protocol, Session, Settings};
+use crate::secrets::Secret;
 
 /// Split a command line into words, honouring single and double quotes.
 pub fn split_words(s: &str) -> Vec<String> {
@@ -134,37 +135,7 @@ fn expand(template: &str, s: &Session) -> Vec<String> {
     out
 }
 
-/// Start a user defined external tool for a session (detached, no shell).
-/// Placeholders: {host} {port} {user} {name} {protocol}
-pub fn run_tool(template: &str, s: &Session) -> Result<()> {
-    let argv: Vec<String> = split_words(template)
-        .into_iter()
-        .map(|w| {
-            w.replace("{host}", s.host.trim())
-                .replace("{port}", &s.effective_port().to_string())
-                .replace("{user}", &s.username)
-                .replace("{name}", &s.display_name())
-                .replace("{protocol}", &format!("{:?}", s.protocol).to_lowercase())
-        })
-        .filter(|w| !w.is_empty())
-        .collect();
-    let Some(program) = argv.first() else {
-        bail!("empty command");
-    };
-    let mut child = Command::new(program)
-        .args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("cannot start '{program}'"))?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
-pub fn launch(s: &Session, password: Option<String>, settings: &Settings) -> Result<()> {
+pub fn launch(s: &Session, password: Option<Secret>, settings: &Settings) -> Result<()> {
     if s.host.trim().is_empty() {
         bail!("no host name configured");
     }
@@ -189,8 +160,8 @@ pub fn launch(s: &Session, password: Option<String>, settings: &Settings) -> Res
     let stdin_args = plan
         .password_on_stdin
         .then(|| match password.filter(|p| !p.is_empty()) {
-            Some(pw) => format!("/p:{pw}\n"),
-            None => String::new(),
+            Some(pw) => Secret::new(format!("/p:{}\n", pw.as_str())),
+            None => Secret::default(),
         });
     if argv.is_empty() {
         bail!("empty command");

@@ -1,8 +1,8 @@
 //! SSH client: host key verification, authentication (key file, agent,
 //! password, keyboard-interactive), jump hosts and local port forwarding.
 
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
@@ -14,13 +14,52 @@ use tokio::sync::oneshot;
 
 use super::known_hosts::{self, HostKeyStatus};
 use super::{ConnCmd, ConnEvent, Ctx, PromptField, PromptReply, Prompter};
+use crate::keys as keyfiles;
 use crate::model::Session;
-use crate::secrets::{self, Kind};
+use crate::secrets::{self, Kind, Secret};
 
 /// Maximum number of jump hosts in a chain (protects against cycles too).
 const MAX_HOPS: usize = 8;
 /// Servers commonly disconnect after 6 failed attempts (MaxAuthTries).
 const MAX_AGENT_KEYS: usize = 5;
+/// Output limit for commands run with [`exec`].
+const MAX_EXEC_OUTPUT: usize = 256 * 1024;
+
+pub struct ExecOutput {
+    pub stdout: String,
+    pub exit_code: Option<u32>,
+}
+
+/// Run a command on its own channel of an established connection and
+/// collect its output. The interactive shell of the tab is not affected.
+pub async fn exec(handle: &Handle<Client>, command: &str, timeout: Duration) -> Result<ExecOutput> {
+    let run = async {
+        let mut channel = handle.channel_open_session().await.context("cannot open channel")?;
+        channel.exec(true, command).await?;
+        let mut out = Vec::new();
+        let mut exit_code = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    if out.len() < MAX_EXEC_OUTPUT {
+                        out.extend_from_slice(&data);
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
+                ChannelMsg::Failure => bail!("the server refused to run the command"),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        Ok(ExecOutput {
+            stdout: String::from_utf8_lossy(&out).into_owned(),
+            exit_code,
+        })
+    };
+    tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| anyhow!("the command did not finish in time"))?
+}
 
 pub struct Client {
     host: String,
@@ -201,6 +240,8 @@ pub async fn run(mut ctx: Ctx) -> Result<String> {
     }
 
     let forwards = start_forwards(&handle, &session, &ctx.events).await;
+    // Allows exec requests (device detection, key installation) on this connection.
+    *ctx.ssh.lock() = Some(handle.clone());
     ctx.connected();
 
     let (mut reader, writer) = channel.split();
@@ -243,6 +284,7 @@ pub async fn run(mut ctx: Ctx) -> Result<String> {
         }
     }
     writer_task.abort();
+    *ctx.ssh.lock() = None;
     for f in forwards {
         f.abort();
     }
@@ -275,11 +317,11 @@ struct AuthState<'a> {
     prompter: &'a Prompter,
     events: &'a Channel<ConnEvent>,
     /// Password supplied by the caller or loaded from the keyring.
-    password: Option<String>,
+    password: Option<Secret>,
     password_from_keyring: bool,
 }
 
-async fn authenticate(h: &mut Handle<Client>, session: &Session, password: Option<String>, ctx: &Ctx) -> Result<()> {
+async fn authenticate(h: &mut Handle<Client>, session: &Session, password: Option<Secret>, ctx: &Ctx) -> Result<()> {
     let target = format!("{}:{}", session.host, session.effective_port());
     let mut user = session.username.trim().to_string();
     if user.is_empty() {
@@ -407,22 +449,13 @@ async fn ask_single(p: &Prompter, title: &str, prompt: &str, echo: bool) -> Opti
     }
 }
 
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
-
 async fn auth_pubkey(h: &mut Handle<Client>, st: &mut AuthState<'_>) -> Result<Option<Outcome>> {
     let mut last = Outcome::NotTried;
     let rsa_hash = h.best_supported_rsa_hash().await.ok().flatten().flatten();
 
     // 1. Explicitly configured key file.
     if !st.session.key_file.trim().is_empty() {
-        let path = expand_home(st.session.key_file.trim());
+        let path = keyfiles::expand_home(st.session.key_file.trim());
         if let Some(key) = load_key(&path, st).await? {
             let key = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
             match result_of(h.authenticate_publickey(st.user.clone(), key).await?) {
@@ -469,8 +502,16 @@ async fn load_key(path: &std::path::Path, st: &AuthState<'_>) -> Result<Option<k
         Err(keys::Error::KeyIsEncrypted) => {}
         Err(e) => bail!("cannot load key file {}: {e}", path.display()),
     }
-    if let Some(pass) = secrets::get(Kind::KeyPassphrase, &st.session.id) {
-        if let Ok(k) = keys::load_secret_key(path, Some(&pass)) {
+    // Passphrases are stored per key file; older versions stored them per session.
+    let key_id = keyfiles::passphrase_id(path);
+    for saved in [
+        secrets::get(Kind::KeyFile, &key_id),
+        secrets::get(Kind::KeyPassphrase, &st.session.id),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(k) = keys::load_secret_key(path, Some(saved.as_str())) {
             return Ok(Some(k));
         }
     }
@@ -489,7 +530,8 @@ async fn load_key(path: &std::path::Path, st: &AuthState<'_>) -> Result<Option<k
                     prompt: "Passphrase:".into(),
                     echo: false,
                 }],
-                can_save: !st.session.id.is_empty(),
+                // Saved per key file, so this also works for unsaved quick connections.
+                can_save: true,
             })
             .await;
         let Some(PromptReply::Auth {
@@ -499,10 +541,10 @@ async fn load_key(path: &std::path::Path, st: &AuthState<'_>) -> Result<Option<k
         else {
             return Ok(None);
         };
-        let pass = r.into_iter().next().unwrap_or_default();
-        if let Ok(k) = keys::load_secret_key(path, Some(&pass)) {
+        let pass: Secret = r.into_iter().next().unwrap_or_default().into();
+        if let Ok(k) = keys::load_secret_key(path, Some(pass.as_str())) {
             if save {
-                if let Err(e) = secrets::set(Kind::KeyPassphrase, &st.session.id, &pass) {
+                if let Err(e) = secrets::set(Kind::KeyFile, &key_id, &pass) {
                     notice(st.events, &format!("{e:#}"));
                 }
             }
@@ -580,7 +622,7 @@ fn notice(events: &Channel<ConnEvent>, message: &str) {
 }
 
 /// Ask for the password (unless we still have an unused one).
-async fn next_password(st: &mut AuthState<'_>, attempt: u32, prompt_text: &str) -> Option<(String, bool)> {
+async fn next_password(st: &mut AuthState<'_>, attempt: u32, prompt_text: &str) -> Option<(Secret, bool)> {
     if let Some(p) = st.password.take() {
         return Some((p, false));
     }
@@ -605,9 +647,19 @@ async fn next_password(st: &mut AuthState<'_>, attempt: u32, prompt_text: &str) 
         PromptReply::Auth {
             responses: Some(r),
             save,
-        } => Some((r.into_iter().next().unwrap_or_default(), save)),
+        } => Some((r.into_iter().next().unwrap_or_default().into(), save)),
         _ => None,
     }
+}
+
+/// Only prompts that ask for the login password get the saved password
+/// automatically - never one-time codes or other questions.
+fn is_password_prompt(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    ["password", "passwort", "kennwort"].iter().any(|w| p.contains(w))
+        && !["code", "token", "otp", "one-time", "einmal"]
+            .iter()
+            .any(|w| p.contains(w))
 }
 
 fn remember_password(st: &mut AuthState<'_>, password: &str, save: bool) {
@@ -627,7 +679,7 @@ async fn auth_password(h: &mut Handle<Client>, st: &mut AuthState<'_>) -> Result
         let Some((pw, save)) = next_password(st, attempt, "Password:").await else {
             return Ok(Some(Outcome::Cancelled));
         };
-        match result_of(h.authenticate_password(st.user.clone(), pw.clone()).await?) {
+        match result_of(h.authenticate_password(st.user.clone(), pw.to_string()).await?) {
             None => {
                 remember_password(st, &pw, save);
                 return Ok(None);
@@ -659,7 +711,7 @@ async fn auth_keyboard_interactive(
         .authenticate_keyboard_interactive_start(st.user.clone(), None::<String>)
         .await?;
     let mut rounds = 0;
-    let mut pending_save: Option<String> = None;
+    let mut pending_save: Option<Secret> = None;
     loop {
         rounds += 1;
         if rounds > 10 {
@@ -689,11 +741,17 @@ async fn auth_keyboard_interactive(
             } => {
                 let responses = if prompts.is_empty() {
                     Vec::new()
-                } else if prompts.len() == 1 && !prompts[0].echo && st.password.is_some() {
+                } else if prompts.len() == 1
+                    && !prompts[0].echo
+                    && is_password_prompt(&prompts[0].prompt)
+                    && st.password.is_some()
+                {
                     // Typical "Password:" prompt: answer with the known password.
-                    vec![st.password.take().unwrap_or_default()]
+                    vec![st.password.take().map(|p| p.to_string()).unwrap_or_default()]
                 } else {
-                    let single_secret = prompts.len() == 1 && !prompts[0].echo;
+                    // Only a single password prompt may be saved - never a one-time code.
+                    let single_secret =
+                        prompts.len() == 1 && !prompts[0].echo && is_password_prompt(&prompts[0].prompt);
                     let reply = st
                         .prompter
                         .ask(ConnEvent::Auth {
@@ -721,7 +779,7 @@ async fn auth_keyboard_interactive(
                             save,
                         }) => {
                             if save && single_secret {
-                                pending_save = r.first().cloned();
+                                pending_save = r.first().map(|p| p.clone().into());
                             }
                             r
                         }

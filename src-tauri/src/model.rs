@@ -122,6 +122,9 @@ pub struct Session {
     pub color_scheme: String,
     /// Unix timestamp (seconds) of the last connect, 0 = never.
     pub last_used: u64,
+    /// Device family for ready-made commands, empty = detect automatically
+    /// (needed for Telnet/serial consoles, where detection is not possible).
+    pub device_type: String,
     /// Runtime only: keyring entry (folder id) of an inherited password.
     #[serde(skip)]
     pub password_from: Option<String>,
@@ -162,6 +165,7 @@ impl Default for Session {
             favorite: false,
             color_scheme: String::new(),
             last_used: 0,
+            device_type: String::new(),
             password_from: None,
         }
     }
@@ -372,9 +376,11 @@ pub struct Settings {
     /// Terminal color scheme id ("auto" follows the app theme).
     pub terminal_scheme: String,
     pub snippets: Vec<Snippet>,
-    pub external_tools: Vec<ExternalTool>,
     /// Paste with more lines than this asks for confirmation (0 = never).
     pub paste_warn_lines: u32,
+    /// Identify the remote system after an SSH login (read-only commands on
+    /// a separate channel) to offer matching ready-made commands.
+    pub detect_device: bool,
 }
 
 /// A reusable command that can be sent to one or all terminals.
@@ -386,18 +392,6 @@ pub struct Snippet {
     pub command: String,
     /// Press Enter after sending.
     pub run: bool,
-}
-
-/// mRemoteNG-style "external tool": a program started for a session.
-/// Placeholders: {host} {port} {user} {name} {protocol}
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(default, rename_all = "camelCase")]
-pub struct ExternalTool {
-    pub id: String,
-    pub name: String,
-    pub command: String,
-    /// Run inside a terminal tab (e.g. ping) instead of as a detached program.
-    pub in_terminal: bool,
 }
 
 impl Default for Settings {
@@ -427,8 +421,8 @@ impl Default for Settings {
             sidebar_width: 300,
             terminal_scheme: "auto".into(),
             snippets: Vec::new(),
-            external_tools: Vec::new(),
             paste_warn_lines: 5,
+            detect_device: true,
         }
     }
 }

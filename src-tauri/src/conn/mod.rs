@@ -5,6 +5,7 @@
 //! * raw output bytes via a Tauri IPC `Channel` (binary, no JSON/base64 overhead),
 //! * `ConnEvent`s (status, prompts, close) via a second IPC channel.
 
+mod detect;
 mod known_hosts;
 mod local;
 mod serial;
@@ -26,9 +27,14 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::model::{Protocol, Session, SessionStore, Settings};
+use crate::secrets::Secret;
 
+pub use detect::DeviceInfo;
 pub use local::{list_shells, ShellInfo};
 pub use serial::{list_ports as list_serial_ports, PortInfo};
+
+/// SSH connection of a terminal tab, available while it is connected.
+type SshSlot = Arc<Mutex<Option<Arc<russh::client::Handle<ssh::Client>>>>>;
 
 #[derive(Debug)]
 pub enum ConnCmd {
@@ -137,7 +143,7 @@ impl Output {
 /// Everything a protocol implementation needs.
 pub struct Ctx {
     pub session: Session,
-    pub password: Option<String>,
+    pub password: Option<Secret>,
     pub settings: Settings,
     pub store: SessionStore,
     pub out: Output,
@@ -146,6 +152,7 @@ pub struct Ctx {
     pub cols: u16,
     pub rows: u16,
     pub rx: mpsc::UnboundedReceiver<ConnCmd>,
+    pub ssh: SshSlot,
 }
 
 impl Ctx {
@@ -172,6 +179,14 @@ impl Ctx {
 struct ConnHandle {
     tx: mpsc::UnboundedSender<ConnCmd>,
     task: Option<tokio::task::AbortHandle>,
+    ssh: SshSlot,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecResult {
+    pub output: String,
+    pub exit_code: Option<u32>,
 }
 
 #[derive(Default)]
@@ -183,7 +198,7 @@ pub struct ConnManager {
 
 pub struct ConnectParams {
     pub session: Session,
-    pub password: Option<String>,
+    pub password: Option<Secret>,
     pub settings: Settings,
     pub store: SessionStore,
     pub log_dir: PathBuf,
@@ -197,6 +212,7 @@ impl ConnManager {
     fn make_ctx(&self, id: &str, p: ConnectParams, log: Option<File>) -> (Ctx, mpsc::UnboundedSender<ConnCmd>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let ctx = Ctx {
+            ssh: SshSlot::default(),
             prompter: Prompter {
                 conn_id: id.to_string(),
                 events: p.on_event.clone(),
@@ -223,12 +239,13 @@ impl ConnManager {
         self: &Arc<Self>,
         id: String,
         tx: mpsc::UnboundedSender<ConnCmd>,
+        ssh: SshSlot,
         events: Channel<ConnEvent>,
         fut: F,
     ) where
         F: std::future::Future<Output = Result<String>> + Send + 'static,
     {
-        self.conns.lock().insert(id.clone(), ConnHandle { tx, task: None });
+        self.conns.lock().insert(id.clone(), ConnHandle { tx, task: None, ssh });
         let mgr = self.clone();
         let conn_id = id.clone();
         let task = tauri::async_runtime::spawn(async move {
@@ -274,6 +291,7 @@ impl ConnManager {
 
         let events = p.on_event.clone();
         let (ctx, tx) = self.make_ctx(&id, p, log);
+        let ssh = ctx.ssh.clone();
         let fut = async move {
             match ctx.session.protocol {
                 Protocol::Ssh => ssh::run(ctx).await,
@@ -284,8 +302,37 @@ impl ConnManager {
                 Protocol::Rdp | Protocol::Vnc => unreachable!(),
             }
         };
-        self.spawn_conn(id.clone(), tx, events, fut);
+        self.spawn_conn(id.clone(), tx, ssh, events, fut);
         Ok(id)
+    }
+
+    fn ssh_handle(&self, id: &str) -> Result<Arc<russh::client::Handle<ssh::Client>>> {
+        let conns = self.conns.lock();
+        let h = conns.get(id).ok_or_else(|| anyhow::anyhow!("connection is closed"))?;
+        let slot = h.ssh.lock().clone();
+        slot.ok_or_else(|| anyhow::anyhow!("only available for connected SSH sessions"))
+    }
+
+    /// Run a command on a separate channel of an open SSH connection.
+    pub async fn exec(&self, id: &str, command: &str) -> Result<ExecResult> {
+        let handle = self.ssh_handle(id)?;
+        let out = ssh::exec(&handle, command, Duration::from_secs(20)).await?;
+        Ok(ExecResult {
+            output: out.stdout,
+            exit_code: out.exit_code,
+        })
+    }
+
+    pub async fn detect(&self, id: &str) -> Result<DeviceInfo> {
+        let handle = self.ssh_handle(id)?;
+        for (command, parse) in detect::PROBES {
+            if let Ok(out) = ssh::exec(&handle, command, Duration::from_secs(6)).await {
+                if let Some(info) = parse(&out.stdout) {
+                    return Ok(info);
+                }
+            }
+        }
+        Ok(DeviceInfo::unknown())
     }
 
     /// Open an SFTP session; it is usable once `ConnEvent::Connected` arrives.
@@ -294,8 +341,9 @@ impl ConnManager {
         let id = uuid::Uuid::new_v4().to_string();
         let events = p.on_event.clone();
         let (ctx, tx) = self.make_ctx(&id, p, None);
+        let ssh = ctx.ssh.clone();
         let fut = sftp::run(ctx, self.clone(), id.clone());
-        self.spawn_conn(id.clone(), tx, events, fut);
+        self.spawn_conn(id.clone(), tx, ssh, events, fut);
         Ok(id)
     }
 
@@ -362,6 +410,14 @@ fn open_log(dir: &std::path::Path, session: &Session) -> Result<(File, PathBuf)>
         })
         .collect();
     let path = dir.join(format!("{safe}_{}.log", crate::util::timestamp_for_filename()));
-    let f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    // Logs can contain anything typed into the terminal: owner-only access.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(&path)?;
     Ok((f, path))
 }

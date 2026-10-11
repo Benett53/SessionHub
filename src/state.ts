@@ -4,14 +4,13 @@ import {
   type Folder,
   type InitialState,
   type Paths,
-  type Reachability,
   type Session,
   type SessionStore,
   type Settings,
 } from "./api";
 
 type Listener = () => void;
-type Topic = "store" | "settings" | "selection" | "reachability";
+type Topic = "store" | "settings" | "selection";
 
 /** Value a session inherits from a folder, and where it comes from. */
 export interface Inherited {
@@ -27,12 +26,10 @@ class AppState {
   version = "";
   /** Selected tree item: "s:<id>" / "f:<id>" (several with Ctrl/Shift). */
   selection: string[] = [];
-  reachability = new Map<string, Reachability>();
   private listeners: Record<Topic, Listener[]> = {
     store: [],
     settings: [],
     selection: [],
-    reachability: [],
   };
 
   init(s: InitialState) {
@@ -76,11 +73,6 @@ class AppState {
   select(keys: string[]) {
     this.selection = keys;
     this.emit("selection");
-  }
-
-  setReachability(results: Reachability[]) {
-    for (const r of results) this.reachability.set(r.id, r);
-    this.emit("reachability");
   }
 
   session(id: string | null | undefined): Session | undefined {

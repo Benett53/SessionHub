@@ -38,6 +38,8 @@ export interface TabHost {
   duplicateTab(tab: Tab): void;
   isActive(tab: Tab): boolean;
   openSftp(session: Session): void;
+  /** Save an unsaved (quick connect) session as a permanent connection. */
+  saveTab(tab: Tab): void;
 }
 
 let tabCounter = 0;
