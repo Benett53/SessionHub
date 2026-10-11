@@ -57,20 +57,15 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+          # The changes of each version are added to the release afterwards.
           releaseBody: |
             ## Download
 
-            | System | Datei |
+            | System | File |
             |---|---|
-            | **Linux (alle Distributionen)** | `SessionHub_*_amd64.AppImage` – herunterladen, ausführbar machen (`chmod +x`), starten |
-            | Debian, Ubuntu, Linux Mint, Pop!_OS | `SessionHub_*_amd64.deb` – `sudo apt install ./SessionHub_*_amd64.deb` |
-            | Fedora, openSUSE | `SessionHub-*.x86_64.rpm` – `sudo dnf install ./SessionHub-*.x86_64.rpm` |
-            | **Windows 10/11** | `SessionHub_*_x64-setup.exe` (Installer) oder `SessionHub_*_x64_en-US.msi` |
+            | Windows 10/11 | `SessionHub_*_x64-setup.exe` (installer, updates an existing installation) or `SessionHub_*_x64_en-US.msi` |
+            | Debian, Ubuntu, Linux Mint | `SessionHub_*_amd64.deb` |
+            | Fedora, openSUSE | `SessionHub-*.x86_64.rpm` |
+            | Other Linux | `SessionHub_*_amd64.AppImage` |
 
-            **Linux:** benötigt WebKitGTK 4.1 (Ubuntu 22.04+, Debian 12+, Fedora 37+, Arch, openSUSE Leap 15.5+).
-            Gespeicherte Passwörter nutzen den System-Schlüsselbund (GNOME Keyring, KWallet, KeePassXC).
-
-            **Windows:** Die Installer sind nicht signiert. SmartScreen fragt deshalb beim ersten Start nach –
-            „Weitere Informationen“ → „Trotzdem ausführen“.
-
-            Details und Funktionen: siehe [README](https://github.com/${{ github.repository }}#readme).
+            Linux requires WebKitGTK 4.1. The Windows installers are not signed, so SmartScreen asks for confirmation on first start.
