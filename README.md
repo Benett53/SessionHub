@@ -26,7 +26,7 @@ Terminal and session manager for Windows and Linux: SSH, SFTP, Telnet, serial, l
 
 ## Installation
 
-Download the latest release: [Releases](https://github.com/baba537/SessionHub/releases/latest)
+Download the latest release: [Releases](https://github.com/Benett53/SessionHub/releases/latest)
 
 | System | Package |
 |---|---|
