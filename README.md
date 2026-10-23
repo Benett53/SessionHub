@@ -1,6 +1,16 @@
+<div align="center">
+
+<img src="assets/icon.svg" width="88" alt="SessionHub icon">
+
 # SessionHub
 
 Terminal and session manager for Windows and Linux: SSH, SFTP, Telnet, serial, local shells, and RDP/VNC through installed clients.
+
+[![Release](https://img.shields.io/github/v/release/Benett53/SessionHub)](https://github.com/Benett53/SessionHub/releases/latest)
+
+</div>
+
+![Main window with connection tree and terminal](docs/main.png)
 
 ## Features
 
@@ -14,6 +24,10 @@ Terminal and session manager for Windows and Linux: SSH, SFTP, Telnet, serial, l
 | Organization | Folder tree with search, favorites, drag and drop. Folders pass username, key, jump host, password and color to the connections inside. Quick connect (`user@host:port`, `telnet://host`, `COM3`), quick connections can be saved permanently |
 | Workspace | Tabs, split view (side by side, stacked, 2×2), broadcast input, command palette (`Ctrl+Shift+P`), 13 color schemes, English and German |
 | Import | mRemoteNG (`confCons.xml`), PuTTY, `~/.ssh/config`, JSON export/import |
+
+Split view from the command palette:
+
+![Split view](docs/split-view.gif)
 
 ## Security
 
@@ -38,6 +52,8 @@ Download the latest release: [Releases](https://github.com/Benett53/SessionHub/r
 Linux requires WebKitGTK 4.1 and, for saved passwords, a Secret Service (GNOME Keyring, KWallet or KeePassXC). Serial ports need membership in the `dialout` (or `uucp`) group.
 
 Settings are stored in `%APPDATA%\SessionHub` or `~/.config/sessionhub` and are kept on updates. A folder named `sessionhub-data` next to the executable enables portable mode.
+
+![New connection dialog](docs/new-connection.png)
 
 ## Keyboard shortcuts
 
