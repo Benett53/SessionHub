@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, errorText, newSession, sessionTitle, type Protocol, type Session } from "./api";
 import { editFolder, editSession, editSettings, importExport, PROTOCOL_LABELS, setConnectHook, showShortcuts } from "./dialogs";
 import { initI18n, t } from "./i18n";
+import { initUpdates, onUpdate } from "./updates";
 import { icon, protocolIcon, type IconName } from "./icons";
 import { keyManager } from "./keys";
 import { notify } from "./notifications";
@@ -88,6 +89,7 @@ async function main() {
   }
   state.init(initial);
   initI18n(state.settings.language);
+  void initUpdates();
   applyTheme();
   document.body.classList.add(`os-${state.platform}`);
   const win = getCurrentWindow();
@@ -234,7 +236,11 @@ async function main() {
   };
 
   // ----------------------------------------------------- main menu (☰) ----
+  let updateVersion: string | null = null;
   const mainMenu = (): MenuItem[] => [
+    ...(updateVersion
+      ? [{ label: t("Update to {0} ...", updateVersion), icon: "info" as const, action: () => editSettings("about") }, SEP]
+      : []),
     item("newFolder"),
     item("keys"),
     item("import"),
@@ -333,6 +339,12 @@ async function main() {
   const menuBtn = toolBtn("menu", "", t("Menu"), (e) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     contextMenu(r.right - 260, r.bottom + 4, mainMenu());
+  });
+  // A small dot on the menu button instead of a pop-up when a new version is out.
+  onUpdate((view) => {
+    updateVersion = view.state === "available" ? view.available : null;
+    menuBtn.classList.toggle("has-update", updateVersion !== null);
+    menuBtn.title = updateVersion ? `${t("Menu")} - ${t("Version {0} is available", updateVersion)}` : t("Menu");
   });
   const toolbar = h(
     "header",

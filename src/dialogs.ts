@@ -17,12 +17,14 @@ import {
   type Session,
   type Settings,
   type Snippet,
+  type UpdateView,
 } from "./api";
 import { FAMILIES } from "./commands";
 import { t } from "./i18n";
 import { icon, protocolIcon, type IconName } from "./icons";
 import { keyManager } from "./keys";
 import { notify } from "./notifications";
+import { onUpdate, updateState } from "./updates";
 import { state } from "./state";
 import { DEFAULT_FONT } from "./terminal";
 import { SCHEMES } from "./themes";
@@ -549,6 +551,35 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
   const rdp = h("input", { type: "text", value: cur.rdpCommand, spellcheck: false, placeholder: state.isWindows() ? "mstsc.exe /v:{host}:{port}" : t("(automatic: FreeRDP or Remmina)") }) as HTMLInputElement;
   const vnc = h("input", { type: "text", value: cur.vncCommand, spellcheck: false, placeholder: t("(automatic: TigerVNC or Remmina)") }) as HTMLInputElement;
   const detect = checkbox(t("Detect the system after an SSH login and offer matching commands"), cur.detectDevice);
+  const autoUpdate = checkbox(t("Check for updates automatically once a day"), cur.checkUpdates);
+  const updateLine = h("span", { class: "muted" });
+  const updateButton = h("button", { class: "btn", type: "button" }) as HTMLButtonElement;
+  const showUpdate = (view: UpdateView) => {
+    const busy = view.state === "checking" || view.state === "downloading" || view.state === "installing";
+    updateLine.className = view.state === "available" ? "update-available" : view.state === "failed" ? "update-failed" : "muted";
+    updateLine.textContent =
+      view.state === "checking"
+        ? t("Checking ...")
+        : view.state === "upToDate"
+          ? t("Up to date")
+          : view.state === "available"
+            ? t("Version {0} is available", view.available ?? "")
+            : view.state === "downloading"
+              ? view.total
+                ? t("Downloading ... {0} %", String(Math.floor((view.received * 100) / view.total)))
+                : t("Downloading ...")
+              : view.state === "installing"
+                ? t("Installing, SessionHub restarts ...")
+                : view.state === "failed"
+                  ? (view.error ?? "")
+                  : "";
+    updateButton.textContent = view.state === "available" ? t("Download and install {0}", view.available ?? "") : t("Check for updates");
+    updateButton.classList.toggle("primary", view.state === "available");
+    updateButton.disabled = busy;
+    updateButton.onclick = () => void (view.state === "available" ? api.updateInstall() : api.updateCheck()).catch((e) => toast(errorText(e), "error"));
+  };
+  const stopUpdates = onUpdate(showUpdate);
+  if (!updateState()) showUpdate({ state: "idle", current: state.version, available: null, received: 0, total: null, error: null });
   const snippets: Snippet[] = structuredClone(cur.snippets);
 
   const body = pages(
@@ -638,6 +669,7 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
           h("h2", {}, `SessionHub ${state.version}`),
           h("p", { class: "muted" }, t("SSH, Telnet, Serial and local shells - fast, stable, organized.")),
           h("dl", { class: "kv" }, h("dt", {}, t("Configuration")), h("dd", { class: "mono" }, `${state.paths.configDir}${state.paths.portable ? ` (${t("portable")})` : ""}`), h("dt", {}, t("Logs")), h("dd", { class: "mono" }, state.paths.logDir)),
+          section(t("Updates"), h("div", { class: "row update-row" }, updateButton, updateLine), autoUpdate.el),
         ),
       },
     ],
@@ -654,6 +686,7 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
     ],
     cancelValue: false,
   });
+  stopUpdates();
   if (!ok) return;
   const next: Settings = {
     ...cur,
@@ -681,6 +714,7 @@ export async function editSettings(initialPage = "appearance"): Promise<void> {
     rdpCommand: rdp.value.trim(),
     vncCommand: vnc.value.trim(),
     detectDevice: detect.input.checked,
+    checkUpdates: autoUpdate.input.checked,
     snippets: snippets.filter((x) => x.command.trim()).map((x) => ({ ...x, name: x.name.trim() || x.command.trim().slice(0, 40) })),
   };
   const languageChanged = next.language !== cur.language;

@@ -1,6 +1,6 @@
 [package]
 name = "sessionhub"
-version = "0.2.0"
+version = "0.3.0"
 description = "SessionHub - cross-platform SSH / Telnet / Serial / Shell session manager"
 authors = ["SessionHub contributors"]
 edition = "2021"
@@ -48,6 +48,9 @@ russh-sftp = "3"
 rand = { version = "0.10", features = ["thread_rng"] }
 # Wipe passwords from memory when they are dropped.
 zeroize = "1"
+ureq = "3"
+minisign-verify = "0.3.0"
+sha2 = "0.11.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

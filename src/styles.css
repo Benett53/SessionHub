@@ -310,6 +310,36 @@ textarea:focus-visible {
   opacity: 0.55;
 }
 
+/* Settings -> About -> Updates. */
+.update-row {
+  align-items: center;
+  gap: 12px;
+}
+
+.update-available {
+  color: var(--accent-2);
+}
+
+.update-failed {
+  color: var(--danger);
+}
+
+/* A new version is available (see updates.ts). */
+.btn.tool.has-update {
+  position: relative;
+}
+
+.btn.tool.has-update::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
 .toolbar .logo {
   width: 20px;
   height: 20px;

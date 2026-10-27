@@ -51,7 +51,13 @@ Download the latest release: [Releases](https://github.com/Benett53/SessionHub/r
 
 Linux requires WebKitGTK 4.1 and, for saved passwords, a Secret Service (GNOME Keyring, KWallet or KeePassXC). Serial ports need membership in the `dialout` (or `uucp`) group.
 
-Settings are stored in `%APPDATA%\SessionHub` or `~/.config/sessionhub` and are kept on updates. A folder named `sessionhub-data` next to the executable enables portable mode.
+Settings are stored in `%APPDATA%\SessionHub` or `~/.config/sessionhub` and are kept on updates.
+
+### Updates
+
+Settings → About shows the version and has a button that downloads and installs the latest release; SessionHub then starts again. A small dot on the menu button shows when a new version is out. With "Check for updates automatically once a day" on, SessionHub asks GitHub for the latest release at most once a day.
+
+The updater installs the same kind of package SessionHub came from: the setup or the MSI on Windows, the AppImage, `.deb` (apt) or `.rpm` (dnf, zypper) on Linux; packages ask for the administrator password. Nothing is installed unless `SHA256SUMS` carries a valid minisign signature from the key built into SessionHub and the downloaded file matches its checksum. Portable copies are updated by hand. A folder named `sessionhub-data` next to the executable enables portable mode.
 
 ![New connection dialog](docs/new-connection.png)
 

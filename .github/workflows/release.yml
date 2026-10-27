@@ -69,3 +69,28 @@ jobs:
             | Other Linux | `SessionHub_*_amd64.AppImage` |
 
             Linux requires WebKitGTK 4.1. The Windows installers are not signed, so SmartScreen asks for confirmation on first start.
+
+  # The checksum list and its signature are what the in-app updater trusts.
+  # The updater ignores a release until both are there.
+  sign:
+    name: Checksums and signature
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sign the release files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          tag="v$(jq -r .version src-tauri/tauri.conf.json)"
+          mkdir dist && cd dist
+          gh release download "$tag" -R "$GITHUB_REPOSITORY"
+          rm -f SHA256SUMS SHA256SUMS.minisig
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          echo "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -m SHA256SUMS -x SHA256SUMS.minisig -t "SessionHub $tag"
+          rm "$RUNNER_TEMP/minisign.key"
+          gh release upload "$tag" SHA256SUMS SHA256SUMS.minisig -R "$GITHUB_REPOSITORY" --clobber

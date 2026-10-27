@@ -381,6 +381,8 @@ pub struct Settings {
     /// Identify the remote system after an SSH login (read-only commands on
     /// a separate channel) to offer matching ready-made commands.
     pub detect_device: bool,
+    /// Ask GitHub for a newer release at most once a day.
+    pub check_updates: bool,
 }
 
 /// A reusable command that can be sent to one or all terminals.
@@ -423,6 +425,7 @@ impl Default for Settings {
             snippets: Vec::new(),
             paste_warn_lines: 5,
             detect_device: true,
+            check_updates: true,
         }
     }
 }

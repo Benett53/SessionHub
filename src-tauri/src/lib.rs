@@ -5,6 +5,7 @@ mod keys;
 mod model;
 mod secrets;
 mod store;
+mod update;
 mod util;
 
 use std::path::PathBuf;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 use conn::{ConnCmd, ConnEvent, ConnManager, ConnectParams, PromptReply};
 use model::{Folder, Session, SessionStore, Settings};
@@ -234,14 +235,86 @@ fn move_items(
     })
 }
 
+/// The updater's state as the settings dialog shows it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateView {
+    /// idle, checking, upToDate, available, downloading, installing, failed
+    state: &'static str,
+    current: &'static str,
+    available: Option<String>,
+    received: u64,
+    total: Option<u64>,
+    error: Option<String>,
+}
+
 #[tauri::command]
-fn save_settings(state: State<'_, AppState>, mut settings: Settings) -> CmdResult<Settings> {
+fn update_status(updater: State<'_, update::Updater>) -> UpdateView {
+    use update::Status;
+    let mut view = UpdateView {
+        state: "idle",
+        current: update::CURRENT_VERSION,
+        available: None,
+        received: 0,
+        total: None,
+        error: None,
+    };
+    match updater.status() {
+        Status::Idle => {}
+        Status::Checking => view.state = "checking",
+        Status::UpToDate => view.state = "upToDate",
+        Status::Available(release) => {
+            view.state = "available";
+            view.available = Some(release.version);
+        }
+        Status::Downloading(received, total) => {
+            view.state = "downloading";
+            view.received = received;
+            view.total = total;
+        }
+        Status::Installing => view.state = "installing",
+        Status::Failed(error) => {
+            view.state = "failed";
+            view.error = Some(error);
+        }
+    }
+    view
+}
+
+#[tauri::command]
+fn update_check(app: tauri::AppHandle, updater: State<'_, update::Updater>) {
+    updater.check(move || {
+        let _ = app.emit("update-status", ());
+    });
+}
+
+#[tauri::command]
+fn update_install(app: tauri::AppHandle, updater: State<'_, update::Updater>) -> CmdResult<()> {
+    let release = updater.available().ok_or("no update available")?;
+    let watched = updater.inner().clone();
+    updater.install(release, move || {
+        let _ = app.emit("update-status", ());
+        // The installer takes over from here.
+        if watched.wants_exit() {
+            app.exit(0);
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn save_settings(
+    state: State<'_, AppState>,
+    updater: State<'_, update::Updater>,
+    mut settings: Settings,
+) -> CmdResult<Settings> {
     settings.font_size = settings.font_size.clamp(6, 72);
     settings.scrollback = settings.scrollback.min(1_000_000);
     settings.line_height = settings.line_height.clamp(0.8, 3.0);
     settings.connect_timeout = settings.connect_timeout.clamp(1, 300);
     settings.sidebar_width = settings.sidebar_width.clamp(150, 900);
     store::save_json(&state.paths.settings_file(), &settings).map_err(err)?;
+    updater.set_automatic(settings.check_updates);
     *state.settings.lock() = settings.clone();
     Ok(settings)
 }
@@ -556,8 +629,22 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let state = app.state::<AppState>();
+            let automatic = state.settings.lock().check_updates;
+            let file = state.paths.config_dir.join("last-update-check");
+            let handle = app.handle().clone();
+            let updater = update::Updater::new(automatic, file, move || {
+                let _ = handle.emit("update-status", ());
+            });
+            app.manage(updater);
+            Ok(())
+        })
         .manage(state)
         .invoke_handler(tauri::generate_handler![
+            update_status,
+            update_check,
+            update_install,
             get_state,
             get_store,
             save_session,

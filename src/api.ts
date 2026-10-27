@@ -99,6 +99,16 @@ export interface Settings {
   snippets: Snippet[];
   pasteWarnLines: number;
   detectDevice: boolean;
+  checkUpdates: boolean;
+}
+
+export interface UpdateView {
+  state: "idle" | "checking" | "upToDate" | "available" | "downloading" | "installing" | "failed";
+  current: string;
+  available: string | null;
+  received: number;
+  total: number | null;
+  error: string | null;
 }
 
 export interface Paths {
@@ -193,6 +203,9 @@ export interface ShellInfo {
 
 export const api = {
   getState: () => invoke<InitialState>("get_state"),
+  updateStatus: () => invoke<UpdateView>("update_status"),
+  updateCheck: () => invoke<void>("update_check"),
+  updateInstall: () => invoke<void>("update_install"),
   getStore: () => invoke<SessionStore>("get_store"),
   saveSession: (session: Session, password: string | null) =>
     invoke<Session>("save_session", { session, password }),
