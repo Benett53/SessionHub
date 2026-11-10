@@ -10,6 +10,7 @@ import { authPrompt, hostKeyPrompt } from "./prompts";
 import { state } from "./state";
 import { nextTabKey, type Tab, type TabHost, type TabStatus } from "./tab";
 import { confirmDialog, contextMenu, h, promptDialog, SEP, type MenuItem } from "./ui";
+import { localFileName } from "./util";
 
 export function formatSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -508,16 +509,18 @@ export class SftpTab implements Tab {
   private async download() {
     const files = this.selection().filter((e) => !e.isDir);
     if (!this.connId || !files.length) return;
-    const sep = state.isWindows() ? "\\" : "/";
+    const windows = state.isWindows();
+    const sep = windows ? "\\" : "/";
     let targets: [SftpEntry, string][];
     if (files.length === 1) {
-      const dest = await saveFile({ title: t("Download"), defaultPath: files[0].name });
+      const dest = await saveFile({ title: t("Download"), defaultPath: localFileName(files[0].name, windows) });
       if (!dest) return;
       targets = [[files[0], dest]];
     } else {
       const dir = await openFile({ title: t("Download to folder"), directory: true, multiple: false });
       if (typeof dir !== "string") return;
-      targets = files.map((f) => [f, `${dir.replace(/[\\/]+$/, "")}${sep}${f.name}`]);
+      // The names come from the server and must not lead out of `dir`.
+      targets = files.map((f) => [f, `${dir.replace(/[\\/]+$/, "")}${sep}${localFileName(f.name, windows)}`]);
     }
     for (const [f, local] of targets) {
       await this.transfer("down", f.name, (id, ch) => api.sftpDownload(this.connId!, joinRemote(this.path, f.name), local, id, ch));

@@ -29,3 +29,21 @@ export function splitWords(s: string): string[] {
   if (inWord) out.push(cur);
   return out;
 }
+
+/**
+ * A name from a remote listing as a single local file name.
+ *
+ * The server chooses the names it reports. One such as "..\..\x" or "a/b"
+ * would leave the folder picked for a download, so everything that separates
+ * path components becomes "_". On Windows the same goes for the characters
+ * and device names the file system reserves ("x:y" would write an alternate
+ * data stream, "NUL" would discard the file).
+ */
+export function localFileName(name: string, windows: boolean): string {
+  let out = name.replace(/[/\u0000]/g, "_");
+  if (windows) {
+    out = out.replace(/[\\:*?"<>|]/g, "_").replace(/[. ]+$/, "");
+    if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)/i.test(out)) out = `_${out}`;
+  }
+  return out === "" || out === "." || out === ".." ? "_" : out;
+}
