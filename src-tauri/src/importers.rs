@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::XmlVersion;
 use serde::Serialize;
 
 use crate::model::{FlowControl, Folder, Parity, Protocol, Session, SessionStore};
@@ -85,7 +86,7 @@ fn attrs(e: &BytesStart) -> HashMap<String, String> {
         .flatten()
         .filter_map(|a| {
             let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
-            let val = a.unescape_value().ok()?.to_string();
+            let val = a.normalized_value(XmlVersion::Implicit1_0).ok()?.to_string();
             Some((key, val))
         })
         .collect()
