@@ -162,8 +162,22 @@ pub fn known_algorithms(path: &Path, host: &str, port: u16) -> Vec<Algorithm> {
     out
 }
 
+/// Whether `host` can be written to the file as the name of one host.
+///
+/// The name comes from a session, which may have been imported. Written
+/// as it is, a line break would add a line of its own, and `*`, `?`, `!`,
+/// `,` or brackets would make the entry apply to other hosts.
+fn is_plain_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with(['|', '@', '#'])
+        && !host
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ',' | '*' | '?' | '!' | '[' | ']'))
+}
+
 /// Record `key` for `host`, removing every other key recorded for it.
 pub fn learn(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<()> {
+    anyhow::ensure!(is_plain_host(host), "'{host}' cannot be recorded as a host name");
     let pattern = host_pattern(host, port);
     // Only a missing file starts empty. If the file cannot be read for any
     // other reason, replacing it would lose every recorded host.
@@ -318,6 +332,38 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         assert!(learn(&path, "srv", 22, &key(1)).is_err());
         assert!(path.is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn host_names_cannot_add_entries() {
+        let dir = std::env::temp_dir().join(format!("sh-kh-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("known_hosts");
+        learn(&path, "srv", 22, &key(1)).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        // Names as a prepared session file could carry them: a second line,
+        // patterns that match other hosts, another host's entry.
+        for host in [
+            "a\nvictim",
+            "*",
+            "a,victim",
+            "!a",
+            "srv?",
+            "[victim]:2222",
+            "|1|x|y",
+            "@revoked",
+            "a b",
+            "",
+        ] {
+            assert!(learn(&path, host, 22, &key(2)).is_err(), "{host:?} was recorded");
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(check(&path, "victim", 22, &key(2)), HostKeyStatus::Unknown);
+        // Ordinary names and addresses still work.
+        for host in ["srv.example.com", "10.0.0.1", "fe80::1%eth0", "bücher.example"] {
+            learn(&path, host, 2222, &key(2)).unwrap();
+            assert_eq!(check(&path, host, 2222, &key(2)), HostKeyStatus::Known);
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
