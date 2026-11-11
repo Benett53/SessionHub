@@ -111,8 +111,14 @@ fn line_key(line: &str, host: &str) -> Option<PublicKey> {
     parse_public_key_base64(key).ok()
 }
 
+/// The file as text. It is not required to be UTF-8: a comment in another
+/// encoding must not make every host unknown.
+fn read_lossy(path: &Path) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&fs::read(path)?).into_owned())
+}
+
 pub fn check(path: &Path, host: &str, port: u16, key: &PublicKey) -> HostKeyStatus {
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(content) = read_lossy(path) else {
         return HostKeyStatus::Unknown;
     };
     let pattern = host_pattern(host, port);
@@ -140,7 +146,7 @@ pub fn check(path: &Path, host: &str, port: u16, key: &PublicKey) -> HostKeyStat
 /// The client asks for these first, so a server that has several host keys
 /// answers with the one that can be checked.
 pub fn known_algorithms(path: &Path, host: &str, port: u16) -> Vec<Algorithm> {
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(content) = read_lossy(path) else {
         return Vec::new();
     };
     let pattern = host_pattern(host, port);
@@ -159,13 +165,25 @@ pub fn known_algorithms(path: &Path, host: &str, port: u16) -> Vec<Algorithm> {
 /// Record `key` for `host`, removing every other key recorded for it.
 pub fn learn(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<()> {
     let pattern = host_pattern(host, port);
-    let existing = fs::read_to_string(path).unwrap_or_default();
-    let mut out = String::with_capacity(existing.len() + 128);
-    for line in existing.lines() {
-        let stale = line_key(line, &pattern).is_some();
+    // Only a missing file starts empty. If the file cannot be read for any
+    // other reason, replacing it would lose every recorded host.
+    let existing = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    // The other lines are written back byte for byte.
+    let mut out = Vec::with_capacity(existing.len() + 128);
+    let mut lines: Vec<&[u8]> = existing.split(|b| *b == b'\n').collect();
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let stale = line_key(&String::from_utf8_lossy(line), &pattern).is_some();
         if !stale {
-            out.push_str(line);
-            out.push('\n');
+            out.extend_from_slice(line);
+            out.push(b'\n');
         }
     }
     let encoded = key.to_openssh().context("encoding host key")?;
@@ -174,7 +192,7 @@ pub fn learn(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<()> 
     let (Some(algo), Some(b64)) = (parts.next(), parts.next()) else {
         anyhow::bail!("invalid key encoding");
     };
-    out.push_str(&format!("{pattern} {algo} {b64}\n"));
+    out.extend_from_slice(format!("{pattern} {algo} {b64}\n").as_bytes());
 
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -187,7 +205,7 @@ pub fn learn(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<()> 
     let tmp = path.with_extension("sessionhub-tmp");
     {
         let mut f = fs::File::create(&tmp)?;
-        f.write_all(out.as_bytes())?;
+        f.write_all(&out)?;
         f.sync_all()?;
     }
     fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
@@ -269,6 +287,37 @@ mod tests {
         assert_eq!(check(&path, "srv", 22, &ecdsa), HostKeyStatus::Known);
         assert_eq!(check(&path, "srv", 22, &ed), HostKeyStatus::Changed);
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn other_encodings_are_kept() {
+        let dir = std::env::temp_dir().join(format!("sh-kh-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("known_hosts");
+        learn(&path, "other", 22, &key(3)).unwrap();
+        // A comment in Latin-1, as an old editor would have saved it.
+        let mut content = b"# caf\xe9\r\n".to_vec();
+        content.extend(fs::read(&path).unwrap());
+        fs::write(&path, &content).unwrap();
+
+        assert_eq!(check(&path, "other", 22, &key(3)), HostKeyStatus::Known);
+        assert_eq!(known_algorithms(&path, "other", 22), [Algorithm::Ed25519]);
+        learn(&path, "srv", 22, &key(1)).unwrap();
+        assert_eq!(check(&path, "other", 22, &key(3)), HostKeyStatus::Known);
+        assert_eq!(check(&path, "srv", 22, &key(1)), HostKeyStatus::Known);
+        assert!(fs::read(&path).unwrap().starts_with(b"# caf\xe9\n"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_file_is_not_replaced() {
+        let dir = std::env::temp_dir().join(format!("sh-kh-{}", uuid::Uuid::new_v4()));
+        // A folder where the file should be: reading fails for another
+        // reason than "not there yet".
+        let path = dir.join("known_hosts");
+        fs::create_dir_all(&path).unwrap();
+        assert!(learn(&path, "srv", 22, &key(1)).is_err());
+        assert!(path.is_dir());
         fs::remove_dir_all(dir).unwrap();
     }
 
