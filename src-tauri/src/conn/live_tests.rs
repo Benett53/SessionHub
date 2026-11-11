@@ -584,6 +584,37 @@ async fn password_retry_and_cancel() {
 }
 
 #[tokio::test]
+async fn keyboard_interactive_prompt_names_the_host() {
+    let _home = TestHome::new();
+    // The server labels its question like SessionHub's own passphrase dialog.
+    let server = TestServer::start(
+        vec![ed25519()],
+        Behaviour {
+            methods: vec![MethodKind::KeyboardInteractive],
+            challenge: ("Key passphrase", "Passphrase:"),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (result, ui) = login(session(server.port), None, |e| match e["type"].as_str() {
+        Some("hostKey") => accept_host_key(false),
+        Some("auth") => answer(PASSWORD),
+        _ => None,
+    })
+    .await;
+    assert_eq!(result, Ok(()));
+    let prompt = &ui.events_of("auth")[0];
+    assert!(
+        prompt["title"].as_str().unwrap().contains("tester@127.0.0.1"),
+        "the title must say who is asking: {prompt}"
+    );
+    assert_eq!(prompt["instructions"], "Key passphrase");
+    assert_eq!(prompt["prompts"][0]["prompt"], "Passphrase:");
+    // Text from the server is never stored as the password.
+    assert_eq!(prompt["canSave"], false);
+}
+
+#[tokio::test]
 async fn keyboard_interactive_uses_the_given_password() {
     let _home = TestHome::new();
     let server = TestServer::start(

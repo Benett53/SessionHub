@@ -790,14 +790,20 @@ async fn auth_keyboard_interactive(
                     let reply = st
                         .prompter
                         .ask(ConnEvent::Auth {
+                            // The title always says who is asking. The name the
+                            // server gives its question is shown below it: as the
+                            // title, it could pass for another host of a jump chain
+                            // or for the passphrase prompt of a local key.
                             title: if attempt > 0 && rounds == 1 {
                                 "Access denied - try again".to_string()
-                            } else if name.trim().is_empty() {
-                                login_title(st)
                             } else {
-                                name.clone()
+                                login_title(st)
                             },
-                            instructions: instructions.clone(),
+                            instructions: [name.trim(), instructions.trim()]
+                                .into_iter()
+                                .filter(|text| !text.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
                             prompts: prompts
                                 .iter()
                                 .map(|p| PromptField {
