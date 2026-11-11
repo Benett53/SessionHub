@@ -123,7 +123,9 @@ impl Telnet {
                         State::Data
                     }
                     IAC => {
-                        self.sb.push(IAC);
+                        if self.sb.len() < 4096 {
+                            self.sb.push(IAC);
+                        }
                         State::Sb
                     }
                     _ => State::Data,
@@ -297,6 +299,20 @@ mod tests {
         expected.extend_from_slice(b"XTERM-256COLOR");
         expected.extend_from_slice(&[IAC, SE]);
         assert_eq!(reply, expected);
+    }
+
+    #[test]
+    fn subnegotiation_buffer_is_bounded() {
+        let mut t = Telnet::new("xterm", 80, 24);
+        let (mut data, mut reply) = (Vec::new(), Vec::new());
+        t.feed(&[IAC, SB, OPT_TTYPE], &mut data, &mut reply);
+        // A server that never ends the subnegotiation, with plain and with
+        // escaped bytes.
+        for _ in 0..10_000 {
+            t.feed(&[b'x', IAC, IAC], &mut data, &mut reply);
+        }
+        assert!(t.sb.len() <= 4096, "{} bytes buffered", t.sb.len());
+        assert!(data.is_empty());
     }
 
     #[test]
