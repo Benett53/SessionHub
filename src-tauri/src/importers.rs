@@ -464,6 +464,7 @@ pub fn import_json(store: &mut SessionStore, path: &Path) -> Result<ImportReport
         .map(|f| Folder {
             id: map[&f.id].clone(),
             parent: remap(&f.parent),
+            jump_host: remap(&f.jump_host),
             ..f.clone()
         })
         .collect();
@@ -529,6 +530,32 @@ mod tests {
         assert_eq!(r2.duplicates, 4);
         assert_eq!(r2.folders, 0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn json_keeps_the_jump_host_of_a_folder() {
+        let export = r#"{
+            "folders": [{ "id": "f1", "name": "Behind the bastion", "jumpHost": "s1" }],
+            "sessions": [
+                { "id": "s1", "name": "bastion", "host": "bastion.example" },
+                { "id": "s2", "name": "db", "host": "10.0.0.5", "folder": "f1", "savePassword": true }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join(format!("export-{}.json", new_id()));
+        std::fs::write(&path, export).unwrap();
+        let mut store = SessionStore::default();
+        let r = import_json(&mut store, &path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!((r.sessions, r.folders), (2, 1));
+        // What the app does after every change of the store.
+        store.repair();
+
+        let bastion = store.sessions.iter().find(|s| s.name == "bastion").unwrap();
+        let db = store.sessions.iter().find(|s| s.name == "db").unwrap();
+        assert_ne!(bastion.id, "s1");
+        assert!(!db.save_password);
+        // Without the jump host the connection would be tried directly.
+        assert_eq!(store.resolve(db).jump_host.as_deref(), Some(bastion.id.as_str()));
     }
 
     #[test]
