@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use russh::keys::ssh_key::LineEnding;
-use russh::keys::{Algorithm, PrivateKey};
+use russh::keys::{Algorithm, EcdsaCurve, PrivateKey};
 use russh::server::{self, Auth, Msg};
 use russh::{ChannelId, MethodKind, MethodSet};
 use serde_json::Value;
@@ -75,6 +75,16 @@ impl Drop for TestHome {
 
 fn ed25519() -> PrivateKey {
     PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap()
+}
+
+fn ecdsa() -> PrivateKey {
+    PrivateKey::random(
+        &mut rand::rng(),
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        },
+    )
+    .unwrap()
 }
 
 /// What the frontend would be for a connection: it records the events and
@@ -482,6 +492,49 @@ async fn host_key_refused_or_changed() {
     assert_eq!(host_key_prompts(&ui), [true]);
     assert_ne!(home.known_hosts(), recorded);
     assert_eq!(home.known_hosts().lines().count(), 1);
+}
+
+#[tokio::test]
+async fn host_key_of_another_type_counts_as_changed() {
+    let _home = TestHome::new();
+    let server = TestServer::start(vec![ed25519()], password_only()).await;
+    let (result, _ui) = login(session(server.port), Some(PASSWORD), |e| {
+        (e["type"] == "hostKey").then(|| accept_host_key(true)).flatten()
+    })
+    .await;
+    assert_eq!(result, Ok(()));
+
+    // Someone answering for the host with a key of a different type must
+    // not look like a first contact.
+    server.set_keys(vec![ecdsa()]);
+    let (result, ui) = login(session(server.port), Some(PASSWORD), |e| {
+        (e["type"] == "hostKey").then_some(PromptReply::HostKey {
+            accept: false,
+            remember: false,
+        })
+    })
+    .await;
+    assert_eq!(result, Err("host key of 127.0.0.1 was not accepted".into()));
+    assert_eq!(host_key_prompts(&ui), [true]);
+}
+
+#[tokio::test]
+async fn known_host_key_type_is_preferred() {
+    let _home = TestHome::new();
+    let known = ecdsa();
+    let server = TestServer::start(vec![known.clone()], password_only()).await;
+    let (result, _ui) = login(session(server.port), Some(PASSWORD), |e| {
+        (e["type"] == "hostKey").then(|| accept_host_key(true)).flatten()
+    })
+    .await;
+    assert_eq!(result, Ok(()));
+
+    // The server gains a key of a type the client would normally prefer.
+    // The recorded key still identifies it: no question.
+    server.set_keys(vec![ed25519(), known]);
+    let (result, ui) = login(session(server.port), Some(PASSWORD), |_| None).await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(host_key_prompts(&ui), [] as [bool; 0]);
 }
 
 #[tokio::test]

@@ -118,6 +118,18 @@ async fn verify_host_key(host: &str, port: u16, key: &PublicKey, prompter: &Prom
     }
 }
 
+/// `preferred` with the key types on record for the host moved to the front.
+fn prefer_known(preferred: &[keys::Algorithm], known: &[keys::Algorithm]) -> Vec<keys::Algorithm> {
+    // An RSA key is one type, whichever hash signs with it.
+    let same_type = |a: &keys::Algorithm, b: &keys::Algorithm| {
+        matches!((a, b), (keys::Algorithm::Rsa { .. }, keys::Algorithm::Rsa { .. })) || a == b
+    };
+    let is_known = |a: &keys::Algorithm| known.iter().any(|k| same_type(a, k));
+    let mut out: Vec<_> = preferred.iter().filter(|a| is_known(a)).cloned().collect();
+    out.extend(preferred.iter().filter(|a| !is_known(a)).cloned());
+    out
+}
+
 fn config(ctx: &Ctx, session: &Session) -> Arc<client::Config> {
     let mut cfg = client::Config {
         keepalive_interval: ctx.keepalive(),
@@ -125,6 +137,15 @@ fn config(ctx: &Ctx, session: &Session) -> Arc<client::Config> {
         nodelay: true,
         ..Default::default()
     };
+    // Ask for a host key of a type that is on record (as OpenSSH does). The
+    // server picks the first type of this list that it has; without this, a
+    // server with several keys could answer with one that cannot be checked.
+    let known = known_hosts::default_path()
+        .map(|path| known_hosts::known_algorithms(&path, session.host.trim(), session.effective_port()))
+        .unwrap_or_default();
+    if !known.is_empty() {
+        cfg.preferred.key = std::borrow::Cow::Owned(prefer_known(&cfg.preferred.key, &known));
+    }
     if session.compression {
         let mut pref = cfg.preferred.clone();
         pref.compression = std::borrow::Cow::Owned(vec![
@@ -848,4 +869,37 @@ async fn start_forwards(
         }));
     }
     tasks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keys::{Algorithm, EcdsaCurve, HashAlg};
+
+    #[test]
+    fn known_host_key_types_come_first() {
+        let preferred = client::Config::default().preferred.key;
+        let p256 = Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        };
+        assert_eq!(preferred[0], Algorithm::Ed25519);
+
+        let out = prefer_known(&preferred, &[Algorithm::Rsa { hash: None }, p256.clone()]);
+        assert_eq!(
+            out[..4],
+            [
+                p256,
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512)
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256)
+                },
+                Algorithm::Rsa { hash: None },
+            ]
+        );
+        // Nothing is dropped: the other types stay available.
+        assert_eq!(out.len(), preferred.len());
+        assert_eq!(out[4], Algorithm::Ed25519);
+    }
 }

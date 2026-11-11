@@ -11,14 +11,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use data_encoding::BASE64;
 use hmac::{Hmac, Mac};
-use russh::keys::{parse_public_key_base64, PublicKey};
+use russh::keys::{parse_public_key_base64, Algorithm, PublicKey};
 use sha1::Sha1;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HostKeyStatus {
     Known,
     Unknown,
-    /// A different key with the same algorithm is recorded.
+    /// Keys are recorded for the host, but not this one.
     Changed,
 }
 
@@ -122,9 +122,10 @@ pub fn check(path: &Path, host: &str, port: u16, key: &PublicKey) -> HostKeyStat
             if recorded.key_data() == key.key_data() {
                 return HostKeyStatus::Known;
             }
-            if recorded.algorithm() == key.algorithm() {
-                changed = true;
-            }
+            // Any other key counts, whatever its type (as in OpenSSH):
+            // otherwise a key of a type that is not on record would pass
+            // for the first contact with the host.
+            changed = true;
         }
     }
     if changed {
@@ -134,13 +135,34 @@ pub fn check(path: &Path, host: &str, port: u16, key: &PublicKey) -> HostKeyStat
     }
 }
 
-/// Record `key` for `host`, removing any stale key of the same algorithm.
+/// Types of the keys recorded for `host`, in the order of the file.
+///
+/// The client asks for these first, so a server that has several host keys
+/// answers with the one that can be checked.
+pub fn known_algorithms(path: &Path, host: &str, port: u16) -> Vec<Algorithm> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let pattern = host_pattern(host, port);
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if let Some(recorded) = line_key(line, &pattern) {
+            let algorithm = recorded.algorithm();
+            if !out.contains(&algorithm) {
+                out.push(algorithm);
+            }
+        }
+    }
+    out
+}
+
+/// Record `key` for `host`, removing every other key recorded for it.
 pub fn learn(path: &Path, host: &str, port: u16, key: &PublicKey) -> Result<()> {
     let pattern = host_pattern(host, port);
     let existing = fs::read_to_string(path).unwrap_or_default();
     let mut out = String::with_capacity(existing.len() + 128);
     for line in existing.lines() {
-        let stale = line_key(line, &pattern).is_some_and(|k| k.algorithm() == key.algorithm());
+        let stale = line_key(line, &pattern).is_some();
         if !stale {
             out.push_str(line);
             out.push('\n');
@@ -217,6 +239,36 @@ mod tests {
         assert_eq!(check(&path, "srv", 22, &k2), HostKeyStatus::Known);
         assert_eq!(check(&path, "srv", 22, &k1), HostKeyStatus::Changed);
         assert!(fs::read_to_string(&path).unwrap().contains("# comment"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn other_key_type_is_a_change() {
+        use russh::keys::ssh_key::public::{EcdsaPublicKey, KeyData};
+        use russh::keys::ssh_key::sec1::point::EncodedPoint;
+
+        let dir = std::env::temp_dir().join(format!("sh-kh-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("known_hosts");
+        let ed = key(1);
+        // Any point will do: the key is only compared, never used.
+        let mut point = [4u8; 65];
+        point[1..].fill(7);
+        let ecdsa = PublicKey::from(KeyData::Ecdsa(EcdsaPublicKey::NistP256(
+            EncodedPoint::from_bytes(point).unwrap(),
+        )));
+
+        assert_eq!(known_algorithms(&path, "srv", 22), []);
+        learn(&path, "srv", 22, &ed).unwrap();
+        assert_eq!(known_algorithms(&path, "srv", 22), [Algorithm::Ed25519]);
+        assert_eq!(known_algorithms(&path, "srv", 2222), []);
+        assert_eq!(check(&path, "srv", 22, &ecdsa), HostKeyStatus::Changed);
+        assert_eq!(check(&path, "other", 22, &ecdsa), HostKeyStatus::Unknown);
+
+        // Replacing the key leaves no old one behind that would still be accepted.
+        learn(&path, "srv", 22, &ecdsa).unwrap();
+        assert_eq!(check(&path, "srv", 22, &ecdsa), HostKeyStatus::Known);
+        assert_eq!(check(&path, "srv", 22, &ed), HostKeyStatus::Changed);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
