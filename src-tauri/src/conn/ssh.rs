@@ -421,6 +421,16 @@ enum Outcome {
     Cancelled,
 }
 
+impl Outcome {
+    /// The server no longer takes public keys, typically because one was
+    /// accepted as the first of several factors and the next factor is due.
+    /// Offering more keys would only add failed attempts, and servers
+    /// disconnect after a few of them.
+    fn ends_publickey(&self) -> bool {
+        matches!(self, Outcome::Failed(remaining, _) if !remaining.contains(&MethodKind::PublicKey))
+    }
+}
+
 fn method_names(m: &MethodSet) -> String {
     let names: Vec<&str> = m
         .iter()
@@ -481,6 +491,7 @@ async fn auth_pubkey(h: &mut Handle<Client>, st: &mut AuthState<'_>) -> Result<O
             let key = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
             match result_of(h.authenticate_publickey(st.user.clone(), key).await?) {
                 None => return Ok(None),
+                Some(o) if o.ends_publickey() => return Ok(Some(o)),
                 Some(o) => last = o,
             }
         }
@@ -490,6 +501,7 @@ async fn auth_pubkey(h: &mut Handle<Client>, st: &mut AuthState<'_>) -> Result<O
     if st.session.use_agent {
         match agent_auth(h, &st.user, rsa_hash).await {
             Ok(None) => return Ok(None),
+            Ok(Some(o)) if o.ends_publickey() => return Ok(Some(o)),
             Ok(Some(o)) => last = o,
             Err(e) => log::debug!("agent authentication unavailable: {e:#}"),
         }
@@ -509,6 +521,7 @@ async fn auth_pubkey(h: &mut Handle<Client>, st: &mut AuthState<'_>) -> Result<O
                 let key = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
                 match result_of(h.authenticate_publickey(st.user.clone(), key).await?) {
                     None => return Ok(None),
+                    Some(o) if o.ends_publickey() => return Ok(Some(o)),
                     Some(o) => last = o,
                 }
             }
@@ -617,6 +630,7 @@ where
         {
             Ok(r) => match result_of(r) {
                 None => return Ok(None),
+                Some(o) if o.ends_publickey() => return Ok(Some(o)),
                 Some(o) => last = Some(o),
             },
             Err(e) => log::debug!("agent signing failed: {e}"),

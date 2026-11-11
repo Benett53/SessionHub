@@ -649,6 +649,30 @@ async fn key_file_login() {
 }
 
 #[tokio::test]
+async fn no_more_keys_after_the_first_factor() {
+    let home = TestHome::new();
+    // Two default keys in ~/.ssh; the first one is accepted as first factor.
+    home.write_key("id_ed25519", &ed25519());
+    home.write_key("id_ecdsa", &ecdsa());
+    let server = TestServer::start(
+        vec![ed25519()],
+        Behaviour {
+            methods: vec![MethodKind::PublicKey],
+            key_is_first_factor: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (result, _ui) = login(session(server.port), Some(PASSWORD), |e| {
+        (e["type"] == "hostKey").then(|| accept_host_key(false)).flatten()
+    })
+    .await;
+    assert_eq!(result, Ok(()));
+    // Every further key would count as a failed attempt on the server.
+    assert_eq!(server.log(), ["publickey", "password correct horse"]);
+}
+
+#[tokio::test]
 async fn shell_input_output_close_and_connection_loss() {
     let _home = TestHome::new();
     let server = TestServer::start(vec![ed25519()], password_only()).await;
