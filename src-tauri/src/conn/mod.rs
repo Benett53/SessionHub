@@ -7,6 +7,8 @@
 
 mod detect;
 mod known_hosts;
+#[cfg(test)]
+mod live_tests;
 mod local;
 mod serial;
 pub mod sftp;

@@ -23,7 +23,7 @@ pub enum HostKeyStatus {
 }
 
 pub fn default_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ssh").join("known_hosts"))
+    crate::util::home_dir().map(|h| h.join(".ssh").join("known_hosts"))
 }
 
 fn host_pattern(host: &str, port: u16) -> String {

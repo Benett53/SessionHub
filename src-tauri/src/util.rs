@@ -1,6 +1,35 @@
 //! Small helpers without extra dependencies.
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The user's home directory (`~/.ssh` lives there).
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = test_home::get() {
+        return Some(dir);
+    }
+    dirs::home_dir()
+}
+
+/// Lets a test use a home directory of its own, for its thread only.
+#[cfg(test)]
+pub mod test_home {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub fn get() -> Option<PathBuf> {
+        HOME.with(|home| home.borrow().clone())
+    }
+
+    pub fn set(dir: Option<PathBuf>) {
+        HOME.with(|home| *home.borrow_mut() = dir);
+    }
+}
 
 /// Local-time-independent `YYYY-MM-DD_HH-MM-SS` (UTC) for file names.
 pub fn timestamp_for_filename() -> String {

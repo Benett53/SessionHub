@@ -476,7 +476,7 @@ async fn auth_pubkey(h: &mut Handle<Client>, st: &mut AuthState<'_>) -> Result<O
 
     // 3. Default unencrypted keys, like OpenSSH does.
     if st.session.key_file.trim().is_empty() {
-        if let Some(ssh_dir) = dirs::home_dir().map(|h| h.join(".ssh")) {
+        if let Some(ssh_dir) = crate::util::home_dir().map(|h| h.join(".ssh")) {
             for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
                 let path = ssh_dir.join(name);
                 if !path.exists() {
