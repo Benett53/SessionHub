@@ -47,3 +47,28 @@ export function localFileName(name: string, windows: boolean): string {
   }
   return out === "" || out === "." || out === ".." ? "_" : out;
 }
+
+/** Every way a line can end in pasted text; a lone CR is the Enter key. */
+const LINE_END = /\r\n|\r|\n/;
+
+/** Number of lines a paste would send to the terminal. */
+export function pasteLineCount(text: string): number {
+  return text.replace(/(?:\r\n|\r|\n)$/, "").split(LINE_END).length;
+}
+
+/** The first `count` lines of a text that is about to be pasted. */
+export function pasteLines(text: string, count: number): string[] {
+  return text.split(LINE_END).slice(0, count);
+}
+
+/**
+ * Pasted text without control characters, except tab and line ends.
+ *
+ * The clipboard is filled by other programs and web pages. ESC could end
+ * bracketed paste early ("ESC [ 201 ~"), so that the rest runs as typed
+ * input, and characters such as Ctrl+O run the line in a shell even without
+ * a line end.
+ */
+export function pasteSafe(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
+}

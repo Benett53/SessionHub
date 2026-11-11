@@ -19,6 +19,7 @@ import { state } from "./state";
 import { nextTabKey, type Tab, type TabHost, type TabStatus } from "./tab";
 import { schemeById } from "./themes";
 import { confirmDialog, contextMenu, h, toast, SEP, type MenuItem } from "./ui";
+import { pasteLineCount, pasteLines, pasteSafe } from "./util";
 
 /** Effective terminal colors for a session (session scheme > global > app theme). */
 export function schemeFor(session: Session | null) {
@@ -153,6 +154,19 @@ export class TerminalTab implements Tab {
         this.paste();
       }
     });
+
+    // A paste the webview delivers itself (not through paste() above) takes
+    // the same checked path instead of going to xterm.js directly.
+    this.termEl.addEventListener(
+      "paste",
+      (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const text = e.clipboardData?.getData("text/plain");
+        if (text) void this.pasteText(text);
+      },
+      true,
+    );
 
     this.observer = new ResizeObserver(() => this.scheduleFit());
   }
@@ -507,11 +521,13 @@ export class TerminalTab implements Tab {
   }
 
   /** Paste with a safety question for multi-line text (avoids running a pasted script by accident). */
-  async pasteText(text: string) {
-    const lines = text.replace(/\r?\n$/, "").split(/\r?\n/).length;
+  async pasteText(raw: string) {
+    const text = pasteSafe(raw);
+    if (!text) return;
+    const lines = pasteLineCount(text);
     const limit = state.settings.pasteWarnLines;
     if (limit > 0 && lines > limit) {
-      const preview = text.split(/\r?\n/).slice(0, 8).join("\n");
+      const preview = pasteLines(text, 8).join("\n");
       const ok = await confirmDialog(
         t("Paste {0} lines?", String(lines)),
         `${t("The clipboard contains several lines. Each line may be executed immediately.")}\n\n${preview}${lines > 8 ? "\n..." : ""}`,
