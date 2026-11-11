@@ -480,8 +480,38 @@ pub fn import_json(store: &mut SessionStore, path: &Path) -> Result<ImportReport
         })
         .collect();
     let mut report = ImportReport::default();
+    // The file may come from someone else. Point out what would run on this
+    // computer or listen on the network as soon as such a session is opened.
+    let review: Vec<String> = sessions
+        .iter()
+        .filter(|s| !is_duplicate(store, s) && acts_locally(s))
+        .map(|s| format!("'{}'", s.display_name()))
+        .collect();
+    if !review.is_empty() {
+        let shown = review.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        let more = match review.len().saturating_sub(5) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        report.warnings.push(format!(
+            "Check before connecting: {shown}{more} start a local program, pass arguments to an external viewer or forward a port to other computers."
+        ));
+    }
     merge(store, folders, sessions, &mut report);
     Ok(report)
+}
+
+/// Whether opening the session runs something chosen by the session on this
+/// computer, or makes a forwarded port reachable from other computers.
+fn acts_locally(s: &Session) -> bool {
+    let local_program = s.protocol == Protocol::Local && (!s.shell.trim().is_empty() || !s.shell_args.is_empty());
+    let viewer_arguments = matches!(s.protocol, Protocol::Rdp | Protocol::Vnc) && !s.extra_args.trim().is_empty();
+    let open_forward = s.protocol == Protocol::Ssh
+        && s.forwards.iter().any(|f| {
+            let bind = f.bind_address.trim();
+            !(bind.is_empty() || bind == "localhost" || bind == "::1" || bind.starts_with("127."))
+        });
+    local_program || viewer_arguments || open_forward
 }
 
 #[cfg(test)]
@@ -556,6 +586,34 @@ mod tests {
         assert!(!db.save_password);
         // Without the jump host the connection would be tried directly.
         assert_eq!(store.resolve(db).jump_host.as_deref(), Some(bastion.id.as_str()));
+    }
+
+    #[test]
+    fn json_points_out_sessions_that_act_locally() {
+        let export = r#"{
+            "sessions": [
+                { "name": "plain", "host": "srv.example" },
+                { "name": "tunnel", "host": "srv2.example",
+                  "forwards": [{ "bindAddress": "", "localPort": 8080, "remoteHost": "localhost", "remotePort": 80 }] },
+                { "name": "helper", "protocol": "local", "shell": "/bin/sh", "shellArgs": ["-c", "id"] },
+                { "name": "desk", "protocol": "rdp", "host": "pc.example", "extraArgs": "/drive:home,/home" },
+                { "name": "open tunnel", "host": "srv3.example",
+                  "forwards": [{ "bindAddress": "0.0.0.0", "localPort": 8080, "remoteHost": "localhost", "remotePort": 80 }] }
+            ]
+        }"#;
+        let path = std::env::temp_dir().join(format!("export-{}.json", new_id()));
+        std::fs::write(&path, export).unwrap();
+        let mut store = SessionStore::default();
+        let r = import_json(&mut store, &path).unwrap();
+        assert_eq!(r.sessions, 5);
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].starts_with("Check before connecting: 'helper', 'desk', 'open tunnel' start"));
+
+        // Nothing new the second time, so nothing to point out.
+        let r = import_json(&mut store, &path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!((r.sessions, r.duplicates), (0, 5));
+        assert!(r.warnings.is_empty());
     }
 
     #[test]
