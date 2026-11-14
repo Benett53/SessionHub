@@ -1,6 +1,6 @@
 [package]
 name = "sessionhub"
-version = "0.3.0"
+version = "0.3.1"
 description = "SessionHub - cross-platform SSH / Telnet / Serial / Shell session manager"
 authors = ["SessionHub contributors"]
 edition = "2021"
