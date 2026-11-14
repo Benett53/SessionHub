@@ -14,7 +14,7 @@
 //! and the keyring are never used.
 
 use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,7 +90,10 @@ fn ecdsa() -> PrivateKey {
 /// What the frontend would be for a connection: it records the events and
 /// answers prompts.
 struct Ui {
+    // Only the sshd tests (Unix) reach the connection through these two.
+    #[cfg_attr(not(unix), allow(dead_code))]
     mgr: Arc<ConnManager>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     id: String,
     events: Arc<Mutex<Vec<Value>>>,
     output: Arc<Mutex<Vec<u8>>>,
@@ -736,6 +739,7 @@ async fn shell_input_output_close_and_connection_loss() {
 
 #[cfg(unix)]
 mod sshd {
+    use std::path::Path;
     use std::process::{Child, Command, Stdio};
 
     use super::*;
